@@ -127,6 +127,7 @@ def header(active):
 PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name=theme-color content="#0e1013">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Blink Camera</title>
 <script src="/static/mpegts.js"></script>
 <style>__CSS__
@@ -401,6 +402,7 @@ ARM_HTML = ('<span class=pill><span id=status>…</span></span>'
 GALLERY = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name=theme-color content="#0e1013">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Blink Gallery</title>
 <script src="/static/mpegts.js"></script>
 <style>__CSS__
@@ -595,6 +597,18 @@ ICONS = {
     "trash": '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
     "x":     '<path d="M6 6l12 12M18 6 6 18"/>',
 }
+
+
+# Browser-tab icon, served at /favicon.svg (and /favicon.ico). The same camera
+# glyph the UI uses (ICONS["cam"]) in the brand accent on the app's dark
+# background, so it stays legible down to 16px.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<rect width="24" height="24" rx="5" fill="#0e1013"/>'
+    '<g fill="none" stroke="#4da3ff" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></g></svg>'
+).encode()
 
 
 def _build(tpl, active, hright, **extra):
@@ -824,6 +838,8 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 self._send(200, "text/html; charset=utf-8", gallery)
             elif p == "/static/mpegts.js":
                 self._file(os.path.join(STATIC, "mpegts.js"), "application/javascript")
+            elif p in ("/favicon.svg", "/favicon.ico"):
+                self._send(200, "image/svg+xml", FAVICON_SVG, cache=True)
             elif p == "/api/state":
                 try: st = json.load(open(os.path.join(logdir, "state.json")))
                 except Exception: st = {}
