@@ -1,0 +1,35 @@
+# Blink Mini local cloud — replaces Amazon's cloud for the (CA-patched) camera.
+# The camera trusts our my-ca2 cert and reaches us on :8080 (TLS): the router
+# DNATs the camera's immedia-semi.com:443 to this host:8080. The dashboard is
+# published through Traefik at https://blink.lan (LAN-only), like the other apps.
+networks:
+  traefik_webgateway:
+    external: true
+
+services:
+  blinkcloud:
+    build: .
+    image: blinkcloud:latest
+    container_name: blinkcloud
+    restart: unless-stopped
+    networks:
+      - traefik_webgateway
+    ports:
+      - "8080:8080"                 # camera cloud endpoint (TLS); router DNATs camera :443 → here
+    volumes:
+      - /mnt/applications/blinkcloud/media:/app/mitm/local
+      - /mnt/evi-pool/home/corentin/.ntfy-topic:/app/ntfy-topic:ro
+    environment:
+      BLINK_MEDIA_IP: "10.10.10.1"  # address the camera dials for media (the router, which DNATs to us)
+      BLINK_WEB_PORT: "8090"        # dashboard port inside the container (Traefik targets this)
+      BLINK_RETENTION_DAYS: "7"     # rolling media retention in days; 0 = keep forever
+      BLINK_NTFY_URL: "https://ntfy.sh"
+      BLINK_NTFY_TOPIC_FILE: "/app/ntfy-topic"
+      BLINK_DEBUG: "0"              # 1 = also keep raw uploads, .ts, flows/ & polls/ (protocol debugging)
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.blink.rule=Host(`blink.lan`)
+      - traefik.http.routers.blink.entrypoints=websecure
+      - traefik.http.routers.blink.tls=true
+      - traefik.http.routers.blink.middlewares=lan-only@docker
+      - traefik.http.services.blink.loadbalancer.server.port=8090

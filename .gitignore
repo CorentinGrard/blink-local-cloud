@@ -1,0 +1,20 @@
+# Secrets — the local CA private key the camera is flash-patched to trust.
+# Never commit this. See README for how to supply it when deploying.
+certs/v2/my-ca2-key.pem
+*-key.pem
+*.key
+
+# Runtime data
+tools/queue/
+mitm/
+media/
+local/
+
+# Debug artifacts
+*.ts
+*.pyc
+__pycache__/
+
+# Local env
+.venv/
+.env
