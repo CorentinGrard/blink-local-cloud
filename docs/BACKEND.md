@@ -94,10 +94,12 @@ time; the camera simply reconnects on its next poll.
 
 For the camera to reach us instead of Amazon:
 
-- **DNS**: `*.immedia-semi.com` must resolve to a host the camera can reach. The
-  camera uses a handful of names (`rest-hw-e007`, `ccs-e007`, `IS-cam-e007`,
-  and the SNI `immedia-semi.com`); point them all at the router/our host. In the
-  reference deployment this is an AdGuard rewrite on the OpenWrt router.
+- **DNS**: the camera (flash-patched) builds its names under `blink.lan`
+  (`rest-hw-e007.blink.lan`, `is-cam-e007.blink.lan`), and we hand it
+  `ccs-e007.blink.lan` in `owl/status` (`$BLINK_CS_HOST`). `*.blink.lan` must
+  resolve to a host the camera can reach (router/our host). In the reference
+  deployment this is an AdGuard rewrite on the OpenWrt router. An unpatched
+  camera dials `*.immedia-semi.com` instead.
 - **DNAT**: the camera dials port **443**; the router rewrites the camera's
   `:443` to this server's `:8080`. We serve *every* role (REST, CS, bundle,
   media) on that one port — dispatch is by content, not port.
@@ -166,7 +168,7 @@ Endpoints implemented:
 
 | Method & path | Response body | Notes |
 |---|---|---|
-| `GET /api/v1/owl/status` | `{"act":"cs","host":"ccs-e007.immedia-semi.com","wait":5}` | tells the camera which CS host to poll and the poll interval (s). `host` points back at us via DNS. |
+| `GET /api/v1/owl/status` | `{"act":"cs","host":"ccs-e007.blink.lan","wait":5}` | tells the camera which CS host to poll and the poll interval (s). `host` points back at us via DNS. |
 | `POST …/ip_address` | `84.102.210.103` (text/html) | the camera's **public-looking reflexive candidate**. Must *not* be the camera's own LAN IP, or its media subsystem never activates (it ends up with no usable candidate → hollow polls). Overridable via `BLINK_PUBLIC_IP`. Sent with `Account-Id` + `X-Frame-Options` + `X-Xss-Protection`. |
 | `POST …/onboarded` | `{"message":"Onboard Status Updated"}` | sent with `Account-Id`. |
 | anything else | `{}` (200) | logged to `mitm/local/unknown_rest.log` with the request line + body so new endpoints can be implemented. |
@@ -639,6 +641,7 @@ Prebuilt frames captured from the real cloud (or built once) in
 | `BLINK_PORT` | `8080` | camera-facing TLS port |
 | `BLINK_WEB_PORT` | `8090` | dashboard port (Traefik target) |
 | `BLINK_MEDIA_IP` | `10.10.10.1` | IP handed to the camera as the media host (router, DNATs to us) |
+| `BLINK_CS_HOST` | `ccs-e007.blink.lan` | CS hostname returned by `GET /api/v1/owl/status` (must resolve to us) |
 | `BLINK_PUBLIC_IP` | `84.102.210.103` | reflexive candidate returned by REST `/ip_address` (must look public) |
 | `BLINK_RETENTION_DAYS` | `7` | rolling media retention; `0` = forever |
 | `BLINK_MOTION_COOLDOWN` | `35` | min seconds between motion-clip grants |

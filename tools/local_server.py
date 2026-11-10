@@ -228,7 +228,10 @@ _KT_ECHO_TPL = bytes.fromhex(
 def kt_echo(seq):
     """Build the 86B Kt-echo 0x0806 reply echoing the camera's poll Kt sequence."""
     return _KT_ECHO_TPL[:29] + struct.pack(">H", seq) + _KT_ECHO_TPL[31:]
-CS_HOST = "ccs-e007.immedia-semi.com"   # DNS points this at us too
+# CS host handed back in /api/v1/owl/status. The camera is flash-patched to build
+# its own names under blink.lan; this is the one name it gets from us, so keep it
+# there too (DNS rewrites *.blink.lan to the router, which DNATs to us).
+CS_HOST = os.environ.get("BLINK_CS_HOST", "ccs-e007.blink.lan")
 # The real cloud answers POST /ip_address with the camera's PUBLIC IP; the camera
 # uses it as its server-reflexive media candidate. Returning its own LAN IP (what
 # we used to do) leaves it with no usable candidate, so its media subsystem never
