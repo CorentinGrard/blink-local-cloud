@@ -50,9 +50,11 @@ The camera is flash-patched to trust a self-generated CA. The server loads:
 - `certs/v2/chain-dup.pem` — the cert chain (committed), and
 - `certs/v2/my-ca2-key.pem` — its **private key** (git-ignored).
 
-Place your own `my-ca2-key.pem` in `certs/v2/` before building — it must be the
-key matching the CA baked into the camera firmware. Without it the server can't
-start its TLS listener.
+It must be the key matching the CA baked into the camera firmware; without it
+the server can't start its TLS listener. It is **not** copied into the image
+(`.dockerignore`): `compose.yaml` bind-mounts it read-only from
+`/mnt/evi-pool/home/corentin/.blinkcloud/my-ca2-key.pem`, so the stack can be
+built straight from a git checkout (Arcane GitOps sync on the NAS).
 
 ## Run
 

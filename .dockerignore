@@ -1,0 +1,10 @@
+# never bake the CA private key into the image; compose.yaml mounts it
+*-key.pem
+*.key
+.git
+mitm/
+media/
+local/
+tools/queue/
+**/__pycache__
+*.ts

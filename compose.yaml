@@ -19,6 +19,8 @@ services:
     volumes:
       - /mnt/applications/blinkcloud/media:/app/mitm/local
       - /mnt/evi-pool/home/corentin/.ntfy-topic:/app/ntfy-topic:ro
+      # CA private key (never in git): mounted, not baked into the image
+      - /mnt/evi-pool/home/corentin/.blinkcloud/my-ca2-key.pem:/app/certs/v2/my-ca2-key.pem:ro
     environment:
       BLINK_MEDIA_IP: "10.10.10.1"  # address the camera dials for media (the router, which DNATs to us)
       BLINK_WEB_PORT: "8090"        # dashboard port inside the container (Traefik targets this)
