@@ -24,6 +24,12 @@ A separate dashboard (default `:8090`, Traefik-fronted) shows the camera, takes
 snapshots, plays live view in-browser, edits settings, and browses/deletes saved
 motion clips.
 
+> **Reimplementing or hacking on the server?** See
+> [`docs/BACKEND.md`](docs/BACKEND.md) — a full low-level reference: process
+> model, the camera-facing REST + CS binary protocol (wire formats, the
+> `0x0806` lock-step poll, media framing), every action, the settings byte
+> maps, state files, HTTP API, and a from-scratch checklist.
+
 ## Layout
 
 | Path | What |
