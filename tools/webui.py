@@ -203,6 +203,19 @@ __HEADER__
    <div id=settings></div>
    <div class=btns><button id=save disabled>Save</button><button class=sec id=revert hidden>Revert</button><span class=setmsg id=setmsg></span></div>
   </section>
+  <section class=card aria-labelledby=htl>
+   <h2 id=htl>Time-lapse</h2>
+   <div class=set><label for=tl>Auto snapshot</label>
+    <select id=tl aria-label="Automatic snapshot interval">
+     <option value=0>Off</option>
+     <option value=60>Every 1 min</option>
+     <option value=300>Every 5 min</option>
+     <option value=900>Every 15 min</option>
+     <option value=1800>Every 30 min</option>
+     <option value=3600>Every hour</option>
+    </select></div>
+   <div class=hint id=tlmsg>Automatically saves a snapshot on a fixed interval. Off by default.</div>
+  </section>
  </div>
 </div></main>
 __CONFIRM__
@@ -231,6 +244,13 @@ function showArm(a){$('arm').checked=!!a;$('armlbl').textContent=a?'Armed':'Disa
 $('arm').onchange=async()=>{const a=$('arm').checked?1:0;showArm(a);armPendingUntil=Date.now()+6000;
   try{await postJSON('/api/arm',{armed:a});toast(a?'Armed: motion will record clips':'Disarmed',a?'ok':'');}
   catch(e){showArm(!a);toast('Could not change arm state','bad');}};
+
+/* ---------- time-lapse (interval snapshots) ---------- */
+let tlPendingUntil=0;
+$('tl').onchange=async()=>{const v=+$('tl').value;tlPendingUntil=Date.now()+6000;
+  try{await postJSON('/api/timelapse',{seconds:v});
+    toast(v?('Time-lapse on · '+$('tl').selectedOptions[0].text.toLowerCase()):'Time-lapse off',v?'ok':'');}
+  catch(e){toast('Could not change time-lapse','bad');}};
 
 /* ---------- live view ---------- */
 const lv={state:'idle',player:null,t0:0,tries:0,secs:300};   // idle|starting|playing
@@ -360,6 +380,7 @@ async function poll(){
   try{S=await api('/api/state');skew=(S.now||Date.now()/1000)-Date.now()/1000;
     online=!!S.last_seen&&now()-S.last_seen<30;
     if(Date.now()>armPendingUntil&&S.armed!==undefined)showArm(S.armed);
+    if(Date.now()>tlPendingUntil&&S.snapshot_interval!==undefined)$('tl').value=String(S.snapshot_interval||0);
     showSnapshot(S.latest_snapshot);lvTick();snapTick();settingsTick();
     const lm=S.last_media&&S.last_media.ts;if(lm!==lastMediaTs){lastMediaTs=lm;loadRecent();}
   }catch(e){online=false;S={};$('status').textContent='Server unreachable';}
@@ -808,7 +829,10 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 except Exception: st = {}
                 st["latest_snapshot"] = latest_snapshot()
                 st["now"] = time.time()
-                try: st["armed"] = int(bool((get_settings() if get_settings else {}).get("armed")))
+                try:
+                    cur = get_settings() if get_settings else {}
+                    st["armed"] = int(bool(cur.get("armed")))
+                    st["snapshot_interval"] = int(float(cur.get("snapshot_interval") or 0))
                 except Exception: pass
                 self._json(st)
             elif p == "/api/settings":
@@ -897,6 +921,17 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 try:
                     update_settings({"armed": armed, "motion": armed})
                     self._json({"armed": armed, "ts": time.time()})
+                except Exception as e:
+                    self._json({"msg": str(e)}, 500)
+            elif p == "/api/timelapse":
+                # Interval (time-lapse) snapshots: store the interval in seconds
+                # (0 = off) in settings.json; local_server's scheduler reads it live.
+                if not settings_file: return self.send_error(400)
+                try: secs = max(0, int(self._body().get("seconds", 0)))
+                except Exception: secs = 0
+                try:
+                    update_settings({"snapshot_interval": secs})
+                    self._json({"snapshot_interval": secs, "ts": time.time()})
                 except Exception as e:
                     self._json({"msg": str(e)}, 500)
             elif p == "/api/settings":

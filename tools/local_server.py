@@ -63,6 +63,12 @@ RETENTION_DAYS = float(os.environ.get("BLINK_RETENTION_DAYS", "7") or "0")
 _RETAIN_KEEP = {"settings.json", "state.json", "kt_seq.json",
                 "media_request.json", "media_stop"}
 
+# interval (time-lapse) snapshots: take a snapshot every N seconds while the
+# camera is online. Disabled by default (0). The LIVE value is the settings.json
+# key "snapshot_interval" (set from the dashboard); this env var is only the
+# initial default when that key is absent. See _timelapse_janitor.
+SNAPSHOT_INTERVAL_DEFAULT = float(os.environ.get("BLINK_SNAPSHOT_INTERVAL", "0") or "0")
+
 def _prune_old_media():
     """Delete files under LOGDIR older than RETENTION_DAYS (persistent state kept)."""
     if RETENTION_DAYS <= 0:
@@ -204,6 +210,9 @@ def get_settings():
     # settings.json pins 'armed' explicitly.
     if "armed" not in override:
         s["armed"] = 1 if s.get("motion") else 0
+    # server-side automation knob (not a camera setting; patch_settings ignores
+    # unknown keys, so this never touches the heartbeat/config bytes)
+    s.setdefault("snapshot_interval", SNAPSHOT_INTERVAL_DEFAULT)
     return s
 NOTHING_0806 = bytes.fromhex("010000000401000000040100000004")
 # 86B Kt-echo reply: when the camera's 0x0806 poll carries a Kt block (media-session
@@ -1152,6 +1161,39 @@ def handle(raw, peer):
         except Exception: pass
 
 
+# ---- interval (time-lapse) snapshots ------------------------------------
+# Request a snapshot every `snapshot_interval` seconds (settings.json; 0 = off,
+# default BLINK_SNAPSHOT_INTERVAL). Reuses the normal snapshot path by writing
+# MEDIA_REQ, and skips a tick while a media session/request is already in flight
+# or the camera hasn't been seen recently, so it never fights motion/live view.
+_timelapse = {"last": 0.0, "iv": None}
+
+
+def _timelapse_janitor():
+    while True:
+        try:
+            iv = float(get_settings().get("snapshot_interval") or 0)
+            if iv != _timelapse["iv"]:                 # enabled/changed (or startup)
+                _timelapse["iv"] = iv
+                if iv > 0:
+                    _timelapse["last"] = time.time() - iv   # take the first one promptly
+                log(f"time-lapse: {('a snapshot every %gs' % iv) if iv > 0 else 'disabled'}")
+            now = time.time()
+            if iv > 0 and now - _timelapse["last"] >= iv:
+                with _state_lock:
+                    seen = _state.get("last_seen", 0)
+                    streaming = _state.get("streaming")
+                if (now - seen < 30 and not streaming and not _media.get("active")
+                        and not os.path.exists(MEDIA_REQ)):
+                    with open(MEDIA_REQ, "w") as f:
+                        json.dump({"mode": "snapshot", "ts": now, "timelapse": True}, f)
+                    _timelapse["last"] = now
+                    log(f"  >> TIME-LAPSE snapshot (every {iv:g}s)")
+        except Exception as e:
+            log(f"(time-lapse error: {e})")
+        time.sleep(5)
+
+
 def main():
     ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1173,6 +1215,7 @@ def main():
             f"{os.path.relpath(LOGDIR, ROOT)}")
     else:
         log("retention: disabled (BLINK_RETENTION_DAYS<=0) — keeping media forever")
+    threading.Thread(target=_timelapse_janitor, daemon=True).start()
     while True:
         raw, peer = ls.accept()
         threading.Thread(target=handle, args=(raw, peer), daemon=True).start()

@@ -28,6 +28,7 @@ services:
       BLINK_MEDIA_IP: "10.10.10.1"  # address the camera dials for media (the router, which DNATs to us)
       BLINK_WEB_PORT: "8090"        # dashboard port inside the container (Traefik targets this)
       BLINK_RETENTION_DAYS: "7"     # rolling media retention in days; 0 = keep forever
+      BLINK_SNAPSHOT_INTERVAL: "0"  # time-lapse: auto-snapshot every N seconds (0 = off); also settable live in the dashboard
       BLINK_NTFY_URL: "https://ntfy.sh"
       BLINK_NTFY_TOPIC_FILE: "/app/ntfy-topic"
       BLINK_DEBUG: "0"              # 1 = also keep raw uploads, .ts, flows/ & polls/ (protocol debugging)

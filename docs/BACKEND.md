@@ -437,6 +437,7 @@ trigger them by writing the IPC files in §10 — there is no in-process RPC.
 | **Stop live view** | `media_stop` (touch) | `_liveview_session` ends the stream and sends the stops. |
 | **Arm / disarm** | `settings.json` `armed` + `motion` both 0/1 | pushed on the next heartbeat. The firmware records on motion **only when both bytes are set** (§9). |
 | **Change settings** | `settings.json` keys (§9) | overlaid onto the next `0x0807` reply. |
+| **Time-lapse snapshots** | `settings.json` `snapshot_interval` (seconds; 0 = off) | a background thread requests a snapshot every N seconds while the camera is online. See below. |
 | **Motion auto-record** | *(automatic)* | see below. |
 | **Arbitrary raw command** | drop a `*.bin` into `tools/queue/` | sent verbatim on the next poll (seq patched if the poll is media-ready), then moved to `queue/sent/`. Escape hatch for protocol experiments. |
 
@@ -450,6 +451,17 @@ resulting clip is saved tagged `_motion_` and triggers an ntfy push.
 
 Limits: a media request is abandoned after `MEDIA_REQ_TTL` (60 s); at most
 `MEDIA_MAX_SENDS` (12) command sends per request.
+
+**Time-lapse snapshots (automatic).** `_timelapse_janitor` (a background thread)
+reads `snapshot_interval` (seconds) from `settings.json` live — `0` = off
+(default; the env default is `BLINK_SNAPSHOT_INTERVAL`). When it is > 0 and that
+many seconds have elapsed, it writes a normal snapshot `media_request.json`
+(tagged `"timelapse": true`), so the result is an ordinary `.jpg`. It skips a
+tick while a live view is streaming, a media request is already in flight, or the
+camera hasn't been seen in the last 30 s, so it never fights motion recording or
+a manual snapshot/live view. `snapshot_interval` is a **server-only** setting: it
+lives in `settings.json` but is not a camera byte, so `patch_settings` ignores it
+and it never touches the heartbeat/config (§9).
 
 ---
 
@@ -510,7 +522,7 @@ reimplementation must keep.
 |---|---|---|
 | `media_request.json` | UI / motion → server | `{"mode":"snapshot"|"liveview","ip","live","secs","motion","ts"}`. Picked up on the next poll; cleared when the upload starts. TTL 60 s. |
 | `media_stop` | UI → server | presence = stop the current live view. Removed at session start/end. |
-| `settings.json` | UI → server | setting overrides (keys from §9, plus `armed`/`motion`). Overlaid on every `0x0807` reply. |
+| `settings.json` | UI → server | setting overrides (keys from §9, plus `armed`/`motion`, plus the server-only `snapshot_interval`). Overlaid on every `0x0807` reply (unknown keys ignored). |
 | `kt_seq.json` | server | `{"next": <u16>}` — persisted command sequence counter. |
 | `state.json` | server → UI | live status snapshot (written atomically via temp+rename). Fields: `ip`, `last_seen`(+`_str`), `last_opcode`, `last_action`, `req_count`, `onboarded`, `poll_size`, `poll_seq`, `media_ready`, `streaming` (`{since,live,secs}` or null), `settings_pushed`, `last_media`. |
 | `unknown_rest.log` | server | appended: unimplemented REST request lines + bodies. |
@@ -553,6 +565,7 @@ Routes:
 | POST | `/api/liveview?secs=N` | write `media_request.json` (liveview, `secs` clamped 5–600) |
 | POST | `/api/stop` | touch `media_stop`, remove `media_request.json` |
 | POST | `/api/arm` | set `armed`+`motion` in `settings.json` (JSON body `{"armed":0/1}`) |
+| POST | `/api/timelapse` | set the time-lapse interval in `settings.json` (JSON body `{"seconds":N}`, `0` = off) |
 | POST | `/api/settings` | merge posted setting keys into `settings.json` (ints only, whitelisted to `SETTINGS_UI`) |
 | POST | `/api/delete` | delete items + siblings |
 
@@ -629,6 +642,7 @@ Prebuilt frames captured from the real cloud (or built once) in
 | `BLINK_PUBLIC_IP` | `84.102.210.103` | reflexive candidate returned by REST `/ip_address` (must look public) |
 | `BLINK_RETENTION_DAYS` | `7` | rolling media retention; `0` = forever |
 | `BLINK_MOTION_COOLDOWN` | `35` | min seconds between motion-clip grants |
+| `BLINK_SNAPSHOT_INTERVAL` | `0` | initial time-lapse interval in seconds (0 = off); the dashboard overrides it live via `settings.json` |
 | `BLINK_NTFY_URL` | `https://ntfy.sh` | ntfy server |
 | `BLINK_NTFY_TOPIC` | — | ntfy topic (secret); or via file |
 | `BLINK_NTFY_TOPIC_FILE` | `/app/ntfy-topic` | file holding the topic (mounted read-only) |
