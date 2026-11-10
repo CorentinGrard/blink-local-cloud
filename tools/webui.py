@@ -264,10 +264,10 @@ function endLive(msg,bad){destroyPlayer();lv.state='idle';$('vph').innerHTML='<s
 $('live').onclick=async()=>{
   if(!window.mpegts||!mpegts.isSupported()){toast('This browser can’t play the live stream.','bad');return;}
   lv.secs=+$('secs').value;lv.state='starting';lv.t0=Date.now();lv.tries=0;lvUI();
-  try{await api('/api/liveview?secs='+lv.secs,{method:'POST'});}catch(e){endLive('Could not reach the server.',true);return;}
+  try{await postJSON('/api/liveview?secs='+lv.secs);}catch(e){endLive('Could not reach the server.',true);return;}
   attachPlayer();
 };
-$('stop').onclick=()=>{fetch('/api/stop',{method:'POST'});endLive('Live view stopped.');};
+$('stop').onclick=()=>{postJSON('/api/stop').catch(()=>{});endLive('Live view stopped.');};
 $('mute').onclick=()=>{const v=$('vid');v.muted=!v.muted;$('mute').innerHTML=v.muted?'__I_mute__ Sound off':'__I_sound__ Sound on';};
 $('fs').onclick=()=>{const el=$('stage'),v=$('vid');
   if(document.fullscreenElement)document.exitFullscreen();
@@ -275,7 +275,7 @@ $('fs').onclick=()=>{const el=$('stage'),v=$('vid');
 function lvTick(){                 // called from poll(): follow the server's stream state
   if(lv.state==='starting'){
     if(S.streaming){lv.state='playing';lvUI();}
-    else if(Date.now()-lv.t0>35000){fetch('/api/stop',{method:'POST'});endLive('The camera didn’t start the stream. Try again.',true);}
+    else if(Date.now()-lv.t0>35000){postJSON('/api/stop').catch(()=>{});endLive('The camera didn’t start the stream. Try again.',true);}
   }else if(lv.state==='playing'&&!S.streaming){endLive('Live view ended.');}
 }
 setInterval(()=>{
@@ -295,7 +295,7 @@ $('snap').onclick=async()=>{
   snap.pending=true;snap.prev=(S.latest_snapshot||{}).name||null;snap.t0=Date.now();
   $('snap').innerHTML='<span class=spin style="width:16px;height:16px;border-width:2px"></span> Capturing…';
   $('smsg').textContent='';$('smsg').className='hint';renderStatus();
-  try{await api('/api/snapshot',{method:'POST'});}catch(e){snapDone('Could not reach the server.',true);}
+  try{await postJSON('/api/snapshot');}catch(e){snapDone('Could not reach the server.',true);}
 };
 function snapDone(msg,bad){snap.pending=false;$('snap').innerHTML='__I_cam__ Take snapshot';
   $('smsg').textContent=bad?msg:'';$('smsg').className='hint'+(bad?' bad':'');if(!bad&&msg)toast(msg,'ok');renderStatus();}
@@ -693,6 +693,25 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 deleted.append(n)
         return deleted
 
+    settings_lock = threading.Lock()
+
+    def update_settings(upd):
+        """Merge `upd` into settings.json. Locked so concurrent saves don't drop
+        each other's changes; written to a temp file and renamed so the server's
+        heartbeat never reads a half-written file."""
+        with settings_lock:
+            try:
+                with open(settings_file) as f:
+                    cur = dict(json.load(f))
+            except Exception:
+                cur = {}
+            cur.update(upd)
+            os.makedirs(os.path.dirname(settings_file), exist_ok=True)
+            tmp = settings_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(cur, f)
+            os.replace(tmp, settings_file)
+
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         def log_message(self, *a): pass
@@ -831,9 +850,27 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
             finally:
                 hub.unsubscribe(q)
 
+        def _same_origin(self):
+            """CSRF guard for every POST. Require a JSON body type: a cross-site
+            page can only send one after a CORS preflight, which we never grant.
+            Also reject an Origin / Sec-Fetch-Site that says the request came
+            from another site."""
+            if "application/json" not in self.headers.get("Content-Type", ""):
+                return False
+            if self.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+                return False
+            origin = self.headers.get("Origin")
+            if origin and origin != "null":
+                host = origin.split("://", 1)[-1]
+                if host != self.headers.get("Host", ""):
+                    return False
+            return True
+
         def do_POST(self):
             p = self.path.split("?", 1)[0]
             q = self._query()
+            if not self._same_origin():
+                return self.send_error(403)
             if p == "/api/snapshot":
                 json.dump({"mode": "snapshot", "ts": time.time()}, open(media_req, "w"))
                 self._json({"msg": "ok"})
@@ -850,9 +887,6 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 except Exception: pass
                 self._json({"msg": "ok"})
             elif p == "/api/delete":
-                # JSON-only: a cross-site HTML form can't send application/json
-                if "application/json" not in self.headers.get("Content-Type", ""):
-                    return self.send_error(415)
                 self._json({"deleted": delete_media(self._body().get("names"))})
             elif p == "/api/arm":
                 # Arm/disarm the camera. The firmware records on motion only when
@@ -860,28 +894,20 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 # and disarming both =0. Pushed to the camera on its next heartbeat.
                 if not settings_file: return self.send_error(400)
                 armed = 1 if self._body().get("armed") else 0
-                try: cur = dict(json.load(open(settings_file)))
-                except Exception: cur = {}
-                cur["armed"] = armed
-                cur["motion"] = armed
                 try:
-                    os.makedirs(os.path.dirname(settings_file), exist_ok=True)
-                    json.dump(cur, open(settings_file, "w"))
+                    update_settings({"armed": armed, "motion": armed})
                     self._json({"armed": armed, "ts": time.time()})
                 except Exception as e:
                     self._json({"msg": str(e)}, 500)
             elif p == "/api/settings":
                 if not settings_file: return self.send_error(400)
-                want = self._body()
-                try: cur = dict(json.load(open(settings_file)))
-                except Exception: cur = {}
+                want, upd = self._body(), {}
                 for k, _lbl, _c, _o in SETTINGS_UI:
                     if k in want:
-                        try: cur[k] = int(want[k])
+                        try: upd[k] = int(want[k])
                         except Exception: pass
                 try:
-                    os.makedirs(os.path.dirname(settings_file), exist_ok=True)
-                    json.dump(cur, open(settings_file, "w"))
+                    update_settings(upd)
                     self._json({"msg": "saved", "ts": time.time()})
                 except Exception as e:
                     self._json({"msg": str(e)}, 500)

@@ -178,6 +178,9 @@ def _to_mp4(ts_path):
     return None
 
 
+_settings_cache = {}
+
+
 def get_settings():
     # Defaults = the settings inside the real-cloud heartbeat template (the camera's
     # actual settings when it was captured), so with an untouched settings.json the
@@ -185,9 +188,15 @@ def get_settings():
     s = dict(bp.parse_settings(HEARTBEAT))
     override = {}
     try:
-        override = json.load(open(SETTINGS_FILE))
-    except Exception:
+        with open(SETTINGS_FILE) as f:
+            override = json.load(f)
+        _settings_cache["last_good"] = override
+    except FileNotFoundError:
         pass
+    except Exception:
+        # unreadable/corrupt file: keep the last good overrides rather than
+        # pushing template defaults (which would e.g. disarm an armed camera)
+        override = _settings_cache.get("last_good", {})
     s.update(override)
     # "like stock": the firmware runs motion detection only when BOTH the motion
     # byte and the armed byte are set (verified 2026-11-01 against a real-cloud
@@ -598,8 +607,6 @@ def handle_cs(conn, first, peer):
         # command in the same poll; ack each of its messages (any non-5B record).
         def next_command():
             p = _media_poll(len(data), poll_seq)          # console media request
-            if p is None and poll_seq is not None:
-                p = kt_echo(poll_seq)
             if p is None:
                 q = next_queued()                           # manual .bin in tools/queue/
                 if q:
@@ -607,6 +614,8 @@ def handle_cs(conn, first, peer):
                     if media_ready:
                         p = bp.set_kt_seq(p, poll_seq)
                     log(f"  >> PUSHING queued command {name} ({len(p)}B) to camera")
+            if p is None and poll_seq is not None:
+                p = kt_echo(poll_seq)
             return p
         pushed, retries = False, 0
         hdr = b""
@@ -631,7 +640,10 @@ def handle_cs(conn, first, peer):
                     hdr = rec                        # message header; body follows
                     continue
                 conn.sendall(bp.ACK_0806)            # ack every camera message
-                if hdr[:1] == b"\x03":
+                # the header belongs to this message only; a later single-record
+                # message must not inherit it (a stale '03' looked like a refusal)
+                refused, hdr = hdr[:1] == b"\x03", b""
+                if refused:
                     # '03' + '1a 00 05 Kt 21 <seq> ...' = the camera REFUSED the
                     # command. The real cloud acks it and at once resends the command
                     # with the next seq in the same poll, which is accepted (cloud

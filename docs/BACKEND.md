@@ -254,11 +254,12 @@ poll, in priority order:
 
 1. **Active media request** (`_media_poll`, from `media_request.json`, §10): a
    snapshot or live-view command.
-2. **Kt echo** — if the poll itself carried a media-session `Kt` block (the
+2. **Manual queued command** — the oldest `*.bin` in `tools/queue/` (§8,
+   escape hatch), moved to `tools/queue/sent/` after sending. Its Kt seq is
+   patched to the poll's seq when the poll is media-ready.
+3. **Kt echo** — if the poll itself carried a media-session `Kt` block (the
    camera is mid-session), echo its sequence back (`kt_echo`). A flat idle reply
    here would break the session and degrade the camera to hollow polls.
-3. **Manual queued command** — the oldest `*.bin` in `tools/queue/` (§8,
-   escape hatch), moved to `tools/queue/sent/` after sending.
 4. Otherwise nothing (the three acks already sent *are* the idle reply).
 
 **Command message shape (a `Kt` block).** A command rides after the acks as one
@@ -553,11 +554,14 @@ Routes:
 | POST | `/api/stop` | touch `media_stop`, remove `media_request.json` |
 | POST | `/api/arm` | set `armed`+`motion` in `settings.json` (JSON body `{"armed":0/1}`) |
 | POST | `/api/settings` | merge posted setting keys into `settings.json` (ints only, whitelisted to `SETTINGS_UI`) |
-| POST | `/api/delete` | delete items + siblings; **`application/json` only** (415 otherwise) so a cross-site form can't CSRF a delete |
+| POST | `/api/delete` | delete items + siblings |
+
+**Every POST** must carry `Content-Type: application/json` and must not come from another origin (`Origin` host ≠ `Host`, or `Sec-Fetch-Site` not `same-origin`/`none`); otherwise **403**. This blocks CSRF: a cross-site page can't send JSON without a CORS preflight, which is never granted. `settings.json` writes are locked and atomic (temp file + rename).
 
 **Security posture:** the UI assumes a trusted LAN (no auth; Traefik `lan-only`
 middleware). The only hardening is: `/clips/` and delete validate names against a
-regex and confine paths to the log dir (realpath check), and delete is JSON-only.
+regex and confine paths to the log dir (realpath check), and every POST is
+JSON-only + same-origin (CSRF guard, above).
 A reimplementation exposed more widely must add authn/authz.
 
 Clip durations are probed lazily by `ffprobe` in a background thread, cached by
