@@ -8,8 +8,11 @@ networks:
 
 services:
   blinkcloud:
-    build: .
-    image: blinkcloud:latest
+    # Built by GitHub Actions (.github/workflows/build.yml) and pulled from ghcr.io.
+    # Arcane re-pulls on each deploy (pull_policy: always). To build locally
+    # instead, run `docker compose build` with a `build: .` line added back.
+    image: ghcr.io/corentingrard/blink-local-cloud:latest
+    pull_policy: always
     container_name: blinkcloud
     restart: unless-stopped
     networks:

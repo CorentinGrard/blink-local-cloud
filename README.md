@@ -56,10 +56,24 @@ the server can't start its TLS listener. It is **not** copied into the image
 `/mnt/evi-pool/home/corentin/.blinkcloud/my-ca2-key.pem`, so the stack can be
 built straight from a git checkout (Arcane GitOps sync on the NAS).
 
-## Run
+## Build & deploy
+
+The image is built by **GitHub Actions** (`.github/workflows/build.yml`) on every
+push to `main` and published to the GitHub Container Registry:
+
+```
+ghcr.io/corentingrard/blink-local-cloud:latest
+```
+
+(git tags `vX.Y.Z` also publish an immutable version tag.) `compose.yaml` pulls
+that image with `pull_policy: always`, so **Arcane** on the NAS re-pulls the
+latest build on each deploy — no building on the NAS. The CA key is still mounted
+at runtime (above), so the published image carries no secret.
+
+To run by hand on the NAS:
 
 ```bash
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 Config via env in `compose.yaml`: `BLINK_MEDIA_IP` (address the camera dials for
