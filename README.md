@@ -77,8 +77,28 @@ To run by hand on the NAS:
 docker compose pull && docker compose up -d
 ```
 
-Config via env in `compose.yaml`: `BLINK_MEDIA_IP` (address the camera dials for
-media), `BLINK_WEB_PORT`, `BLINK_RETENTION_DAYS` (rolling media retention),
-`BLINK_NTFY_URL` / `BLINK_NTFY_TOPIC_FILE` (motion push notifications),
-`BLINK_SNAPSHOT_INTERVAL` (initial time-lapse interval in seconds, 0 = off; also
-settable live from the dashboard), `BLINK_DEBUG`.
+### Environment variables
+
+Set in `compose.yaml`. All are optional.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BLINK_PORT` | `8080` | camera-facing TLS port |
+| `BLINK_WEB_PORT` | `8090` | dashboard port (Traefik target) |
+| `BLINK_MEDIA_IP` | `10.10.10.1` | address the camera dials for media (the router, which DNATs to us) |
+| `BLINK_CS_HOST` | `ccs-e007.blink.lan` | command-server hostname handed to the camera in `owl/status` (must resolve to us) |
+| `BLINK_PUBLIC_IP` | `84.102.210.103` | public-looking IP returned by `/ip_address` |
+| `BLINK_RETENTION_DAYS` | `7` | rolling media retention; `0` = keep forever |
+| `BLINK_MOTION_COOLDOWN` | `35` | min seconds between motion-clip grants |
+| `BLINK_SNAPSHOT_INTERVAL` | `0` | initial time-lapse interval in seconds (`0` = off); also settable live from the dashboard |
+| `BLINK_NTFY_URL` | `https://ntfy.sh` | ntfy server for motion push notifications |
+| `BLINK_NTFY_TOPIC` | — | ntfy topic (secret); or use the file below |
+| `BLINK_NTFY_TOPIC_FILE` | `/app/ntfy-topic` | file holding the ntfy topic (mounted read-only) |
+| `BLINK_NTFY_CLICK` | `https://blink.lan` | where tapping a motion push opens |
+| `BLINK_CLIP_BASE_URL` | `https://blink.lan` | base URL for the "Watch clip" action |
+| `BLINK_LIVE_SECS` | `20` | default live-view / clip length (s) |
+| `BLINK_DEBUG` | `0` | `1` keeps raw uploads and protocol captures for debugging |
+
+Protocol tuning and diagnostic knobs (`BLINK_POLL_HOLD`, `BLINK_MEDIA_IDLE`,
+`BLINK_LIVE_DELAY`, `BLINK_LIVE_PLAYER`, `BLINK_LATENCY`, `BLINK_EMPTY_HOLLOW`)
+are described in [docs/BACKEND.md](docs/BACKEND.md).
