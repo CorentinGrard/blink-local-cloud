@@ -188,10 +188,16 @@ class TalkHub:
                                 stderr=subprocess.DEVNULL)
         self._proc, self._sid, self._rx, self._rate = proc, sid, 0, rate
         self.t_feed, self.t_frame = time.time(), 0.0
-        threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
+        # keep each burst's encoded audio (talk_<time>.aac, a few KB/s) so a
+        # problem can be replayed exactly via /api/talk?format=adts
+        try:
+            rec = open(os.path.join(LOGDIR, f"talk_{datetime.datetime.now():%Y%m%d-%H%M%S}.aac"), "wb")
+        except OSError:
+            rec = None
+        threading.Thread(target=self._reader, args=(proc, rec), daemon=True).start()
         log(f"  talk: started (browser audio {rate} Hz)")
 
-    def _reader(self, proc):
+    def _reader(self, proc, rec=None):
         buf = b""
         while True:
             d = proc.stdout.read1(4096)
@@ -210,6 +216,9 @@ class TalkHub:
                     break
                 if n < 64 and b"Lavc" in buf[:n]:      # ffmpeg's metadata-only first frame
                     buf = buf[n:]; continue            # (encoder name, no audio): the cloud never sends one
+                if rec:
+                    try: rec.write(buf[:n])
+                    except OSError: pass
                 with self._lock:
                     if self.live:
                         if not self.t_frame:
@@ -220,6 +229,8 @@ class TalkHub:
                             self._frames.popleft(); self.dropped += 1
                 buf = buf[n:]
         proc.wait()
+        if rec:
+            rec.close()
 
     def _stop_locked(self):
         if self._proc:
