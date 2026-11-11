@@ -241,6 +241,26 @@ class TalkHub:
             return False
         return True
 
+    def feed_adts(self, data):
+        """Queue ready-made ADTS AAC (16 kHz mono) as-is, all of it: plays a
+        pre-encoded clip, and lets us test the camera with exact frames
+        (e.g. the real cloud's captured talk audio). False if not live."""
+        frames, i = [], 0
+        while i + 7 <= len(data):
+            if data[i] != 0xFF or data[i + 1] & 0xF0 != 0xF0:
+                i += 1; continue
+            n = ((data[i + 3] & 3) << 11) | (data[i + 4] << 3) | (data[i + 5] >> 5)
+            if n < 7 or i + n > len(data):
+                break
+            frames.append(data[i:i + n]); i += n
+        with self._lock:
+            if not self.live:
+                return False
+            self._stop_locked()
+            self._frames.extend(frames)
+        log(f"  talk: queued {len(frames)} pre-encoded frame(s)")
+        return True
+
     def end(self, sid=None):
         """Close a talk burst; returns the seconds of browser audio it received."""
         with self._lock:
