@@ -38,10 +38,17 @@ that cloud. Two processes, in one Python program:
 
 | Component | File | Listens | Audience |
 |-----------|------|---------|----------|
-| **Camera server** | `tools/local_server.py` | `:8080` TLS | the camera |
-| **Dashboard** | `tools/webui.py` | `:8090` HTTP | your browser/phone (via Traefik) |
+| **Camera server** | `tools/local_server.py` | `:8080` TLS | the camera: TLS, REST, the CS command channel, settings, janitors |
+| Media session | `tools/liveview.py` | — | `0x0804` live view / snapshot / clip uploads, `LiveHub` |
+| Two-way talk | `tools/talk.py` | — | `TalkHub`: browser mic → AAC frames for the live view |
+| Notifications | `tools/notify.py` | — | ntfy motion pushes |
+| Shared | `tools/common.py` | — | paths, `DEBUG`, `log`/`log_error`, `state.json`, media-request files |
+| **Dashboard** | `tools/webui.py` + `tools/web/` | `:8090` HTTP | your browser/phone (via Traefik) |
 | Protocol codec | `tools/blink_proto.py` | — | library |
 | Media de-chunker | `tools/media_watch.py` | — | library (+ standalone watcher) |
+
+Tests live in `tests/` (stdlib `unittest`, see the README); CI runs them on the
+runner and inside the built image before pushing it.
 
 `local_server.py` is the entry point; it imports `webui` and starts it in a
 thread. `webui` never imports `local_server` — the two communicate only through
@@ -327,7 +334,7 @@ Branch by request size:
 
 The camera opens a new TLS connection and uploads media. `handle_cs` replies the
 right **session-config opening** for what we asked for and then drains the upload
-(`_capture_media`):
+(`liveview.capture_media`):
 
 | We requested | Opening reply sent | Template |
 |---|---|---|
@@ -365,7 +372,7 @@ first JPEG SOI.
 waits. Send the stop `08 00000000 00000000` on seeing the marker (don't wait out
 a timeout).
 
-**Live-view exchange (`_liveview_session`), lock-step:**
+**Live-view exchange (`liveview.liveview_session`), lock-step:**
 
 ```
 S< 182 B  session-config opening (ts-patched)
@@ -413,7 +420,7 @@ records interleaved:
 - Send in real time (one frame per 64 ms), a couple of frames ahead at most.
   Gaps are tolerated: underruns of up to 750 ms didn't break playback.
 
-Our implementation (`TalkHub` → `_liveview_session`): the dashboard posts mic PCM
+Our implementation (`talk.TalkHub` → `liveview_session`): the dashboard posts mic PCM
 to `/api/talk` (§11). One ffmpeg process per talk press encodes it
 (`highpass + acompressor + alimiter`, then `-c:a aac -b:a 32k -ar 16000 -ac 1
 -f adts`), a reader thread splits the ADTS frames into a queue, and the
@@ -444,19 +451,19 @@ Pitfalls found the hard way:
 
 ## 7. Media pipeline
 
-`_capture_media(peer, first, conn, kind, opts, motion)`:
+`capture_media(peer, first, conn, kind, opts, motion)` (`liveview.py`):
 
 1. Opens `mitm/local/<ts>_<ip>_<kind|motion>_0804.bin` and writes the first
    chunk. **Clears the media request immediately** (an upload starting means the
    request was honoured; otherwise every poll during the upload re-sends the
    command and the camera red-LEDs mid-upload).
-2. Drains the upload: live view via `_liveview_session`; snapshot by reading
+2. Drains the upload: live view via `liveview_session`; snapshot by reading
    until the 9-byte end marker (then sends the stop). Idle cutoff
    `BLINK_MEDIA_IDLE` (default 5 s).
 3. Re-classifies on the **complete** upload (`media_kind`) and de-chunks
    (`split_streams`):
    - **live view** (TS present): write `<base>.ts`, carve a `<base>.thumb.jpg`
-     from the type-4 stream, remux to `<base>.mp4` (`_to_mp4`: `ffmpeg -c copy`,
+     from the type-4 stream, remux to `<base>.mp4` (`to_mp4`: `ffmpeg -c copy`,
      GStreamer video-only fallback). No decode happens, so a missing H.264 High
      decoder doesn't matter.
    - **snapshot** (JPEG): carve SOI…EOI → `<base>.jpg`.
@@ -485,7 +492,7 @@ trigger them by writing the IPC files in §10 — there is no in-process RPC.
 |---|---|---|
 | **Snapshot** | `media_request.json` `{"mode":"snapshot"}` | push type-`0x07` command; camera uploads a JPEG → `.jpg`. |
 | **Live view / record clip** | `media_request.json` `{"mode":"liveview","ip","live","secs"}` | push type-`0x05` command with `04 <ip>`; run the live exchange for `secs`; save `.ts`+`.mp4`+`.thumb.jpg`; fan out to the browser hub. `live:true` also opens a local GStreamer window. |
-| **Stop live view** | `media_stop` (touch) | `_liveview_session` ends the stream and sends the stops. |
+| **Stop live view** | `media_stop` (touch) | `liveview_session` ends the stream and sends the stops. |
 | **Arm / disarm** | `settings.json` `armed` + `motion` both 0/1 | pushed on the next heartbeat. The firmware records on motion **only when both bytes are set** (§9). |
 | **Change settings** | `settings.json` keys (§9) | overlaid onto the next `0x0807` reply. |
 | **Time-lapse snapshots** | `settings.json` `snapshot_interval` (seconds; 0 = off) | a background thread requests a snapshot every N seconds while the camera is online. See below. |
@@ -595,9 +602,11 @@ from `/mnt/applications/blinkcloud/media` (compose maps it to `/app/mitm/local`)
 settings_file, talk)` runs a `ThreadingHTTPServer` (HTTP/1.1) on `0.0.0.0:$BLINK_WEB_PORT`
 (default **8090**). Traefik fronts it at `https://blink.lan` (LAN-only).
 
-The UI is two server-rendered pages (Camera, Gallery) built from inline
-HTML/CSS/JS templates (no build step, no external CDN — `mpegts.js` is vendored
-and served from `/static/`). The client polls `/api/state` every 2 s and renders
+The UI is two server-rendered pages (Camera, Gallery) built at startup from the
+templates in `tools/web/` (`camera.html` + `camera.js`, `gallery.html` +
+`gallery.js`, shared `base.css` / `common.js` / `confirm.html`; `webui._build`
+fills their `__PLACEHOLDER__` tokens). No build step, no external CDN —
+`mpegts.js` is vendored and served from `/static/`. The client polls `/api/state` every 2 s and renders
 status, snapshot, live countdown, settings and recent activity from it.
 
 Routes:
@@ -701,6 +710,7 @@ Prebuilt frames captured from the real cloud (or built once) in
 | `BLINK_NTFY_TOPIC_FILE` | `/app/ntfy-topic` | file holding the topic (mounted read-only) |
 | `BLINK_NTFY_CLICK` | `https://blink.lan` | tap target of a motion push |
 | `BLINK_CLIP_BASE_URL` | `https://blink.lan` | base for the "Watch clip" action URL |
+| `BLINK_LOG_DIR` | `mitm/local` | where media, state, settings and `server.log` live (the container mounts its media volume there) |
 | `BLINK_DEBUG` | `0` | keep raw uploads, `.ts`, `flows/`, `polls/`, `talk_*.aac` and per-second talk stats for protocol debugging |
 | `BLINK_POLL_HOLD` | `15.0` | max seconds to hold an `0x0806` long-poll open |
 | `BLINK_LIVE_SECS` | `20` | default live-view/clip length |

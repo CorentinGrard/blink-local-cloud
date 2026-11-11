@@ -36,13 +36,18 @@ motion clips, and can take **snapshots automatically on an interval**
 
 | Path | What |
 |------|------|
-| `tools/local_server.py` | Camera-facing server: TLS, REST, `CS` command channel |
-| `tools/webui.py`        | LAN dashboard (snapshots, live view, settings, gallery) |
+| `tools/local_server.py` | Camera-facing server (entry point): TLS, REST, `CS` command channel |
+| `tools/liveview.py`     | `0x0804` media sessions: live view, snapshots, motion clips |
+| `tools/talk.py`         | Two-way talk: browser mic → camera speaker |
+| `tools/notify.py`, `tools/common.py` | ntfy pushes; shared paths, logging, live state |
+| `tools/webui.py`        | LAN dashboard server (snapshots, live view, settings, gallery) |
+| `tools/web/`            | Dashboard pages: HTML, CSS and JS |
 | `tools/blink_proto.py`  | Blink `CS` binary-protocol parser/encoder |
 | `tools/media_watch.py`  | Reassembles `0x0804` uploads into JPEG / MP4 |
 | `tools/templates/`      | Prebuilt command/config frames pushed to the camera |
 | `tools/static/`         | Vendored `mpegts.js` for in-browser live view |
 | `certs/v2/`             | TLS chain the camera trusts (**private key not committed**) |
+| `tests/`                | Test suite (`unittest`) |
 | `compose.yaml`, `Dockerfile` | Container + Traefik wiring |
 
 ## The CA key (not in git)
@@ -67,7 +72,9 @@ push to `main` and published to the GitHub Container Registry:
 ghcr.io/corentingrard/blink-local-cloud:latest
 ```
 
-(git tags `vX.Y.Z` also publish an immutable version tag.) `compose.yaml` pulls
+(git tags `vX.Y.Z` also publish an immutable version tag.) Each build first runs
+the tests, on the runner and again inside the built image (so they use the
+image's own ffmpeg), and only pushes if they pass. `compose.yaml` pulls
 that image with `pull_policy: always`, so **Arcane** on the NAS re-pulls the
 latest build on each deploy — no building on the NAS. The CA key is still mounted
 at runtime (above), so the published image carries no secret.
@@ -100,6 +107,24 @@ Set in `compose.yaml`. All are optional.
 | `BLINK_LIVE_SECS` | `20` | default live-view / clip length (s) |
 | `BLINK_DEBUG` | `0` | `1` keeps raw uploads, protocol captures and talk recordings for debugging |
 
-Protocol tuning and diagnostic knobs (`BLINK_POLL_HOLD`, `BLINK_MEDIA_IDLE`,
+Protocol tuning and diagnostic knobs (`BLINK_LOG_DIR`, `BLINK_POLL_HOLD`, `BLINK_MEDIA_IDLE`,
 `BLINK_LIVE_DELAY`, `BLINK_LIVE_PLAYER`, `BLINK_LATENCY`, `BLINK_EMPTY_HOLLOW`)
 are described in [docs/BACKEND.md](docs/BACKEND.md).
+
+## Tests
+
+Standard library only (`unittest`). The talk tests need `ffmpeg` and the
+page-script check needs `node`; each is skipped when missing.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+They use a fake camera on a socket pair (no hardware, no CA key) and a temp
+log dir, and take about 20 s. To run them against the image's ffmpeg:
+
+```bash
+docker build -t blink-local-cloud:test .
+docker run --rm -v "$PWD:/src" -w /src -e PYTHONDONTWRITEBYTECODE=1 \
+  blink-local-cloud:test python3 -m unittest discover -s tests
+```
