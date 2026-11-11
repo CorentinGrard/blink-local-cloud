@@ -391,6 +391,30 @@ before each video PES at PTS−`BLINK_LIVE_DELAY` (default 1.5 s) for the local
 GStreamer window only; it is **not** applied to the browser feed (it breaks
 `mpegts.js` continuity → black screen).
 
+**Two-way talk (server → camera speaker).** The live-view socket is
+bidirectional: while streaming, the camera plays any audio we write back on it.
+There is no extra command, setting, or handshake — the real cloud's talk
+downlink (relay capture, 2026-11-11) is exactly the live-view sequence above
+(182 B opening, go, a receiver report per second, the two stops) with audio
+records interleaved:
+
+```
+05 <seq:u32> <len:u32> <ADTS frame: len bytes>
+```
+
+- AAC-LC, **16 kHz, mono**, ADTS (`FF F1 60 40 …`, MPEG-4, no CRC), one
+  1024-sample frame (**64 ms**) per record; `len` = the frame's ADTS length.
+- `seq` starts at 0 for the session and increments per record.
+- Send in real time (one frame per 64 ms). Bursting overruns the camera's buffer.
+
+Our implementation (`TalkHub` → `_liveview_session`): the dashboard posts mic PCM
+to `/api/talk` (§11). One ffmpeg process per talk burst encodes it
+(`-c:a aac -b:a 32k -ar 16000 -ac 1 -f adts`), a reader thread splits the ADTS
+frames into a queue, and the live-view loop sends them, pre-buffering
+`TALK_PREBUFFER` (5) frames before each burst to absorb jitter. Only the
+session thread writes to the TLS socket. Audio posted while no live view is
+running is refused (409).
+
 ---
 
 ## 7. Media pipeline
@@ -543,7 +567,7 @@ from `/mnt/applications/blinkcloud/media` (compose maps it to `/app/mitm/local`)
 ## 11. Web dashboard & HTTP API
 
 `webui.start(hub, logdir, media_req, media_stop, media_ip, port, get_settings,
-settings_file)` runs a `ThreadingHTTPServer` (HTTP/1.1) on `0.0.0.0:$BLINK_WEB_PORT`
+settings_file, talk)` runs a `ThreadingHTTPServer` (HTTP/1.1) on `0.0.0.0:$BLINK_WEB_PORT`
 (default **8090**). Traefik fronts it at `https://blink.lan` (LAN-only).
 
 The UI is two server-rendered pages (Camera, Gallery) built from inline
@@ -566,12 +590,13 @@ Routes:
 | POST | `/api/snapshot` | write `media_request.json` (snapshot) |
 | POST | `/api/liveview?secs=N` | write `media_request.json` (liveview, `secs` clamped 5–600) |
 | POST | `/api/stop` | touch `media_stop`, remove `media_request.json` |
+| POST | `/api/talk?sid=S&rate=R` | two-way talk: body = raw s16le mono PCM at `R` Hz (8000–96000) for talk burst `S`; `&end=1` closes the burst. `Content-Type: application/octet-stream`. **409** when no live view is running, **503** without ffmpeg (§6.4) |
 | POST | `/api/arm` | set `armed`+`motion` in `settings.json` (JSON body `{"armed":0/1}`) |
 | POST | `/api/timelapse` | set the time-lapse interval in `settings.json` (JSON body `{"seconds":N}`, `0` = off) |
 | POST | `/api/settings` | merge posted setting keys into `settings.json` (ints only, whitelisted to `SETTINGS_UI`) |
 | POST | `/api/delete` | delete items + siblings |
 
-**Every POST** must carry `Content-Type: application/json` and must not come from another origin (`Origin` host ≠ `Host`, or `Sec-Fetch-Site` not `same-origin`/`none`); otherwise **403**. This blocks CSRF: a cross-site page can't send JSON without a CORS preflight, which is never granted. `settings.json` writes are locked and atomic (temp file + rename).
+**Every POST** must carry `Content-Type: application/json` (or `application/octet-stream`, used by `/api/talk`; both need a preflight cross-site) and must not come from another origin (`Origin` host ≠ `Host`, or `Sec-Fetch-Site` not `same-origin`/`none`); otherwise **403**. This blocks CSRF: a cross-site page can't send JSON without a CORS preflight, which is never granted. `settings.json` writes are locked and atomic (temp file + rename).
 
 **Security posture:** the UI assumes a trusted LAN (no auth; Traefik `lan-only`
 middleware). The only hardening is: `/clips/` and delete validate names against a

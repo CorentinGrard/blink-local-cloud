@@ -35,6 +35,7 @@ SETTINGS_UI = [
 # removes all of these siblings.
 SIBLING_EXTS = (".jpg", ".mp4", ".ts", ".thumb.jpg", ".bin")
 NAME_RE = re.compile(r"[\w-][\w.-]*")
+TALK_MAX_BODY = 1 << 20     # one /api/talk POST (~100 ms of PCM; generous cap)
 
 # ---------------------------------------------------------------------------
 # Shared look & feel
@@ -148,6 +149,8 @@ PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 .btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center}
 .btns select{min-height:42px}
 .hint{color:var(--mut);font-size:13px;margin-top:8px;min-height:20px}
+#talk{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#talk.on{background:var(--bad);color:#fff}
 .hint.bad{color:var(--bad)}
 .shot{cursor:zoom-in;display:block}
 .recent{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
@@ -181,6 +184,7 @@ __HEADER__
    <div class=btns>
     <button id=live>__I_play__ Start live</button>
     <button class=sec id=stop hidden>__I_stop__ Stop</button>
+    <button class=sec id=talk hidden title="Hold to speak through the camera (Space)">__I_mic__ Hold to talk</button>
     <select id=secs aria-label="Live view duration"><option value=60>1 min</option><option value=180>3 min</option><option value=300 selected>5 min</option><option value=600>10 min</option></select>
    </div>
    <div class=hint id=vmsg></div>
@@ -273,6 +277,7 @@ function lvUI(){
   $('vid').hidden=st!=='playing';$('vph').hidden=st==='playing';
   $('vov').hidden=st!=='playing';$('vtools').hidden=st!=='playing';
   $('live').hidden=st!=='idle';$('secs').hidden=st!=='idle';$('stop').hidden=st==='idle';
+  $('talk').hidden=st!=='playing';if(st!=='playing')talkStop();
   if(st==='starting')$('vph').innerHTML='<div class=spin></div><span>Waking the camera… (a few seconds)</span>';
   else if(st==='idle'&&!$('vphmsg'))$('vph').innerHTML='<span id=vphmsg></span>';
   renderStatus();
@@ -289,7 +294,8 @@ $('live').onclick=async()=>{
   attachPlayer();
 };
 $('stop').onclick=()=>{postJSON('/api/stop').catch(()=>{});endLive('Live view stopped.');};
-$('mute').onclick=()=>{const v=$('vid');v.muted=!v.muted;$('mute').innerHTML=v.muted?'__I_mute__ Sound off':'__I_sound__ Sound on';};
+function muteLabel(){$('mute').innerHTML=$('vid').muted?'__I_mute__ Sound off':'__I_sound__ Sound on';}
+$('mute').onclick=()=>{const v=$('vid');v.muted=!v.muted;if(talk.on)talk.wasMuted=v.muted;muteLabel();};
 $('fs').onclick=()=>{const el=$('stage'),v=$('vid');
   if(document.fullscreenElement)document.exitFullscreen();
   else if(el.requestFullscreen)el.requestFullscreen();else if(v.webkitEnterFullscreen)v.webkitEnterFullscreen();};
@@ -303,6 +309,75 @@ setInterval(()=>{
   if(lv.state==='playing'&&S.streaming){const left=Math.max(0,S.streaming.since+S.streaming.secs-now());
     $('countdown').textContent='· '+fmtDur(left);$('lvaside').textContent=fmtDur(left)+' left';}
 },1000);
+
+/* ---------- two-way talk: hold the button, the camera's speaker plays your mic ----------
+   The mic is open only while the button is held. Audio goes to the server as
+   raw 16-bit PCM in ~100 ms POSTs (in order); the server encodes it to AAC and
+   writes it into the live-view stream. Live sound is muted while talking so the
+   camera's mic doesn't feed your voice back to you. */
+const talk={on:false,stream:null,ctx:null,node:null,src:null,sid:'',buf:[],n:0,q:Promise.resolve(),wasMuted:true,warned:false};
+const TALK_WORKLET="registerProcessor('pcm-tap',class extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true}})";
+function talkUI(){$('talk').classList.toggle('on',talk.on);
+  $('talk').innerHTML=talk.on?'__I_mic__ Talking… release to stop':'__I_mic__ Hold to talk';}
+function talkSend(path,body){
+  talk.q=talk.q.then(()=>fetch(path,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body}))
+    .then(r=>{if(!r.ok&&!talk.warned){talk.warned=true;
+      toast(r.status===409?'Live view isn’t running.':r.status===503?'Talk needs ffmpeg on the server.':'Could not send audio.','bad');talkStop();}})
+    .catch(()=>{});}
+function talkFlush(){
+  if(!talk.n||!talk.ctx)return;
+  const out=new Int16Array(talk.n);let o=0;for(const b of talk.buf){out.set(b,o);o+=b.length;}
+  talk.buf=[];talk.n=0;
+  talkSend('/api/talk?sid='+talk.sid+'&rate='+talk.ctx.sampleRate,out.buffer);
+}
+async function talkStart(){
+  if(talk.on||lv.state!=='playing')return;
+  if(!window.isSecureContext||!navigator.mediaDevices||!window.AudioWorkletNode){
+    toast('Talking needs the dashboard opened over HTTPS in a recent browser.','bad');return;}
+  talk.on=true;talk.warned=false;talk.sid=Math.random().toString(36).slice(2,12);talkUI();
+  const v=$('vid');talk.wasMuted=v.muted;v.muted=true;muteLabel();
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+    if(!talk.on){stream.getTracks().forEach(t=>t.stop());return;}     // released while asking
+    talk.stream=stream;
+    if(!talk.ctx){talk.ctx=new AudioContext();
+      await talk.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([TALK_WORKLET],{type:'application/javascript'})));}
+    if(talk.ctx.state==='suspended')await talk.ctx.resume();
+    if(!talk.on){talkStop();return;}
+    talk.src=talk.ctx.createMediaStreamSource(stream);
+    talk.node=new AudioWorkletNode(talk.ctx,'pcm-tap');
+    const chunk=Math.round(talk.ctx.sampleRate/10);                   // ~100 ms per POST
+    talk.node.port.onmessage=e=>{
+      if(!talk.on)return;
+      const f=e.data,s=new Int16Array(f.length);
+      for(let i=0;i<f.length;i++){const x=Math.max(-1,Math.min(1,f[i]));s[i]=x<0?x*0x8000:x*0x7fff;}
+      talk.buf.push(s);talk.n+=s.length;if(talk.n>=chunk)talkFlush();
+    };
+    talk.src.connect(talk.node);       // not connected to the speakers: no local echo
+  }catch(e){
+    toast(e&&e.name==='NotAllowedError'?'Microphone access was blocked.':'Could not open the microphone.','bad');
+    talkStop();
+  }
+}
+function talkStop(){
+  if(!talk.on&&!talk.stream)return;
+  const was=talk.on;talk.on=false;
+  talkFlush();
+  if(talk.node){talk.node.port.onmessage=null;try{talk.node.disconnect()}catch(e){}talk.node=null;}
+  if(talk.src){try{talk.src.disconnect()}catch(e){}talk.src=null;}
+  if(talk.stream){talk.stream.getTracks().forEach(t=>t.stop());talk.stream=null;}
+  if(was){if(talk.sid)talkSend('/api/talk?sid='+talk.sid+'&end=1',new ArrayBuffer(0));
+    $('vid').muted=talk.wasMuted;muteLabel();}
+  talkUI();
+}
+$('talk').addEventListener('pointerdown',e=>{if(e.button)return;e.preventDefault();
+  try{$('talk').setPointerCapture(e.pointerId)}catch(_){}talkStart();});
+['pointerup','pointercancel','lostpointercapture'].forEach(ev=>$('talk').addEventListener(ev,talkStop));
+$('talk').addEventListener('contextmenu',e=>e.preventDefault());
+$('talk').addEventListener('keydown',e=>{if((e.key===' '||e.key==='Enter')&&!e.repeat){e.preventDefault();talkStart();}});
+$('talk').addEventListener('keyup',e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();talkStop();}});
+window.addEventListener('blur',talkStop);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)talkStop();});
 
 /* ---------- snapshot ---------- */
 const snap={pending:false,prev:null,t0:0};
@@ -592,6 +667,7 @@ ICONS = {
     "cam":   '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
     "mute":  '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M17 9.5l4 5M21 9.5l-4 5"/>',
     "sound": '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>',
+    "mic":   '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/>',
     "fs":    '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
     "dl":    '<path d="M12 4v11m-5-5 5 5 5-5M5 20h14"/>',
     "trash": '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
@@ -623,7 +699,7 @@ def _build(tpl, active, hright, **extra):
 
 
 def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
-          get_settings=None, settings_file=None):
+          get_settings=None, settings_file=None, talk=None):
     page = _build(PAGE, "cam", ARM_HTML, SETTINGS=json.dumps(
         [{"key": k, "label": lbl, "control": c, "options": o} for k, lbl, c, o in SETTINGS_UI]))
     gallery = _build(GALLERY, "gal", GALLERY_HRIGHT,
@@ -895,8 +971,9 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
             page can only send one after a CORS preflight, which we never grant.
             Also reject an Origin / Sec-Fetch-Site that says the request came
             from another site."""
-            if "application/json" not in self.headers.get("Content-Type", ""):
-                return False
+            ctype = self.headers.get("Content-Type", "")
+            if "application/json" not in ctype and "application/octet-stream" not in ctype:
+                return False   # both need a CORS preflight cross-site; we never grant one
             if self.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
                 return False
             origin = self.headers.get("Origin")
@@ -920,6 +997,28 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 json.dump({"mode": "liveview", "ip": media_ip, "live": True,
                            "secs": secs, "ts": time.time()}, open(media_req, "w"))
                 self._json({"msg": "ok"})
+            elif p == "/api/talk":
+                # Two-way talk: a body of raw s16le mono PCM at ?rate=, for talk
+                # burst ?sid=; ?end=1 closes the burst. Played on the camera's
+                # speaker by the running live view (409 when none is running).
+                try: n = int(self.headers.get("Content-Length", 0))
+                except ValueError: n = 0
+                if not 0 <= n <= TALK_MAX_BODY:
+                    return self.send_error(413)
+                pcm = self.rfile.read(n) if n else b""
+                sid = q.get("sid", "")
+                if not talk or not re.fullmatch(r"[A-Za-z0-9]{1,32}", sid):
+                    return self._json({"msg": "bad request"}, 400)
+                if q.get("end"):
+                    talk.end(sid); return self._json({"ok": True})
+                if not talk.ready():
+                    return self._json({"msg": "ffmpeg not installed"}, 503)
+                try: rate = int(q.get("rate", 0))
+                except ValueError: rate = 0
+                if not 8000 <= rate <= 96000:
+                    return self._json({"msg": "bad rate"}, 400)
+                ok = talk.feed(sid, rate, pcm[:len(pcm) & ~1])
+                self._json({"ok": ok}, 200 if ok else 409)
             elif p == "/api/stop":
                 try: open(media_stop, "w").close()
                 except Exception: pass

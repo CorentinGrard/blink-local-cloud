@@ -21,7 +21,8 @@ The camera's `:443` cloud traffic is DNAT'd by the router to this server on
 - captures and decrypts whatever the camera uploads.
 
 A separate dashboard (default `:8090`, Traefik-fronted) shows the camera, takes
-snapshots, plays live view in-browser, edits settings, browses/deletes saved
+snapshots, plays live view in-browser (with **two-way talk**: hold a button to
+speak through the camera's speaker), edits settings, browses/deletes saved
 motion clips, and can take **snapshots automatically on an interval**
 (time-lapse; off by default).
 
