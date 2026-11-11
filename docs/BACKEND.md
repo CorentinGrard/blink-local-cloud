@@ -82,6 +82,9 @@ settings, auto-record on motion — is driven through those two channels (§8).
   bytes (§4).
 - On close, if `BLINK_DEBUG`, writes the full decrypted exchange to
   `mitm/local/flows/`.
+- Every log line also goes to `mitm/local/server.log` (rotated to
+  `server.log.1` past 5 MiB), so the log is readable from the media volume
+  without access to the container's stdout.
 
 There is **no persistent per-camera state in memory** beyond a few module globals
 (onboarding-done flag, current media request, last motion-grant time, live-state
@@ -404,16 +407,38 @@ records interleaved:
 
 - AAC-LC, **16 kHz, mono**, ADTS (`FF F1 60 40 …`, MPEG-4, no CRC), one
   1024-sample frame (**64 ms**) per record; `len` = the frame's ADTS length.
-- `seq` starts at 0 for the session and increments per record.
-- Send in real time (one frame per 64 ms). Bursting overruns the camera's buffer.
+- `seq` starts at **0 for each talk press** and increments per record. If it
+  keeps counting across presses in one live view, the camera plays only the
+  first press and ignores the rest (verified on the camera, 2026-11-11).
+- Send in real time (one frame per 64 ms), a couple of frames ahead at most.
+  Gaps are tolerated: underruns of up to 750 ms didn't break playback.
 
 Our implementation (`TalkHub` → `_liveview_session`): the dashboard posts mic PCM
-to `/api/talk` (§11). One ffmpeg process per talk burst encodes it
-(`-c:a aac -b:a 32k -ar 16000 -ac 1 -f adts`), a reader thread splits the ADTS
-frames into a queue, and the live-view loop sends them, pre-buffering
-`TALK_PREBUFFER` (5) frames before each burst to absorb jitter. Only the
-session thread writes to the TLS socket. Audio posted while no live view is
-running is refused (409).
+to `/api/talk` (§11). One ffmpeg process per talk press encodes it
+(`highpass + acompressor + alimiter`, then `-c:a aac -b:a 32k -ar 16000 -ac 1
+-f adts`), a reader thread splits the ADTS frames into a queue, and the
+live-view loop sends them, pre-buffering `TALK_PREBUFFER` (5) frames before each
+press to absorb jitter. Only the session thread writes to the TLS socket. Audio
+posted while no live view is running is refused (409). `?format=adts` posts
+ready-made ADTS frames instead (queued as-is), e.g. to replay a clip.
+
+Pitfalls found the hard way:
+
+- **ffmpeg input probing.** Without `-probesize 32 -analyzeduration 0`, the
+  image's ffmpeg (7.1) holds the first ~4.4 s of a raw PCM pipe while probing,
+  then drops it: talk starts ~5 s late and short phrases vanish.
+- **Loudness.** Browser mic speech is 10–15 dB quieter than what the Blink app
+  sends (RMS ~4–7k, peaks near full scale), too faint on the camera's speaker;
+  hence the compressor and make-up gain.
+- **A wedged camera.** After a run of failed sessions the camera reached a state
+  where *any* talk audio made it stop its live-view upload within seconds (no
+  error, the stream just stops), while live view without talk still worked.
+  Power-cycling the camera cleared it. Rule this out before debugging talk.
+- **Debugging talk.** With `BLINK_DEBUG=1` the server saves each press's encoded
+  audio as `talk_<time>.aac` (replay it with `?format=adts`) and logs per-second
+  talk stats (frames sent, queue depth, gaps, drops). The camera mixes its
+  speaker output into its own upload, so the recorded live-view audio shows what
+  was played (its echo canceller removes steady tones after ~2 s).
 
 ---
 
@@ -676,7 +701,7 @@ Prebuilt frames captured from the real cloud (or built once) in
 | `BLINK_NTFY_TOPIC_FILE` | `/app/ntfy-topic` | file holding the topic (mounted read-only) |
 | `BLINK_NTFY_CLICK` | `https://blink.lan` | tap target of a motion push |
 | `BLINK_CLIP_BASE_URL` | `https://blink.lan` | base for the "Watch clip" action URL |
-| `BLINK_DEBUG` | `0` | keep raw uploads, `.ts`, `flows/`, `polls/` for protocol debugging |
+| `BLINK_DEBUG` | `0` | keep raw uploads, `.ts`, `flows/`, `polls/`, `talk_*.aac` and per-second talk stats for protocol debugging |
 | `BLINK_POLL_HOLD` | `15.0` | max seconds to hold an `0x0806` long-poll open |
 | `BLINK_LIVE_SECS` | `20` | default live-view/clip length |
 | `BLINK_LIVE_DELAY` | `1.5` | local GStreamer playback cushion / PCR offset (s) |

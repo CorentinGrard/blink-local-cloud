@@ -191,12 +191,14 @@ class TalkHub:
         self._proc, self._sid, self._rx, self._rate = proc, sid, 0, rate
         self.t_feed, self.t_frame = time.time(), 0.0
         self._new_burst = True
-        # keep each burst's encoded audio (talk_<time>.aac, a few KB/s) so a
+        # BLINK_DEBUG: keep each press's encoded audio (talk_<time>.aac) so a
         # problem can be replayed exactly via /api/talk?format=adts
-        try:
-            rec = open(os.path.join(LOGDIR, f"talk_{datetime.datetime.now():%Y%m%d-%H%M%S}.aac"), "wb")
-        except OSError:
-            rec = None
+        rec = None
+        if DEBUG:
+            try:
+                rec = open(os.path.join(LOGDIR, f"talk_{datetime.datetime.now():%Y%m%d-%H%M%S}.aac"), "wb")
+            except OSError:
+                pass
         threading.Thread(target=self._reader, args=(proc, rec), daemon=True).start()
         log(f"  talk: started (browser audio {rate} Hz)")
 
@@ -1182,7 +1184,7 @@ def _liveview_session(conn, fh, idle, live=False, secs=None):
                     dg["gap"] = max(dg["gap"], t_s - dg["last_send"])
                 dg["last_send"] = t_s; dg["sent"] += 1
             if now - dg["t"] >= 1.0:
-                if dg["sent"] or dg["qmax"] or TALK.dropped != dg["drop"]:
+                if DEBUG and (dg["sent"] or dg["qmax"] or TALK.dropped != dg["drop"]):
                     log(f"  talk/s: sent={dg['sent']} seq={talk_seq} q_max={dg['qmax']} "
                         f"max_gap={1000 * dg['gap']:.0f}ms loop_max={1000 * dg['loop']:.0f}ms "
                         f"dropped={TALK.dropped - dg['drop']} restarts={dg['restarts']}")

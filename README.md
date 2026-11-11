@@ -98,7 +98,7 @@ Set in `compose.yaml`. All are optional.
 | `BLINK_NTFY_CLICK` | `https://blink.lan` | where tapping a motion push opens |
 | `BLINK_CLIP_BASE_URL` | `https://blink.lan` | base URL for the "Watch clip" action |
 | `BLINK_LIVE_SECS` | `20` | default live-view / clip length (s) |
-| `BLINK_DEBUG` | `0` | `1` keeps raw uploads and protocol captures for debugging |
+| `BLINK_DEBUG` | `0` | `1` keeps raw uploads, protocol captures and talk recordings for debugging |
 
 Protocol tuning and diagnostic knobs (`BLINK_POLL_HOLD`, `BLINK_MEDIA_IDLE`,
 `BLINK_LIVE_DELAY`, `BLINK_LIVE_PLAYER`, `BLINK_LATENCY`, `BLINK_EMPTY_HOLLOW`)
