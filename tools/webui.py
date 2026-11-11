@@ -1041,6 +1041,8 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                     return self._json({"msg": "bad request"}, 400)
                 if q.get("end"):
                     return self._json({"ok": True, "rx_secs": talk.end(sid)})
+                if q.get("seqmode") in ("reset", "continue"):   # diagnostics knob
+                    talk.seq_mode = q["seqmode"]
                 if q.get("format") == "adts":         # pre-encoded AAC, queued as-is
                     ok = talk.feed_adts(pcm)
                     return self._json({"ok": ok}, 200 if ok else 409)

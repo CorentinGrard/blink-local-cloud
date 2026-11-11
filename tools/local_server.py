@@ -176,6 +176,8 @@ class TalkHub:
         self.dropped = 0             # frames dropped by the backlog cap (diagnostics)
         self.t_feed = self.t_frame = 0.0   # first PCM in / first frame out, this burst
         self.live = False            # set by _liveview_session while streaming
+        self._new_burst = False      # a talk press started; its records restart at seq 0
+        self.seq_mode = "reset"      # "reset" per press (default) | "continue" (diagnostics)
 
     def ready(self):
         import shutil
@@ -188,6 +190,7 @@ class TalkHub:
                                 stderr=subprocess.DEVNULL)
         self._proc, self._sid, self._rx, self._rate = proc, sid, 0, rate
         self.t_feed, self.t_frame = time.time(), 0.0
+        self._new_burst = True
         # keep each burst's encoded audio (talk_<time>.aac, a few KB/s) so a
         # problem can be replayed exactly via /api/talk?format=adts
         try:
@@ -280,7 +283,9 @@ class TalkHub:
             if not self.live:
                 return False
             self._stop_locked()
+            self._frames.clear()
             self._frames.extend(frames)
+            self._new_burst = True
         log(f"  talk: queued {len(frames)} pre-encoded frame(s)")
         return True
 
@@ -303,6 +308,12 @@ class TalkHub:
 
     def qlen(self):
         return len(self._frames)
+
+    def take_new_burst(self):
+        """True once per talk press: the session then restarts the record seq at 0."""
+        with self._lock:
+            nb, self._new_burst = self._new_burst, False
+            return nb
 
     def primed(self):
         """Enough queued to start a burst (or the encoder is done: flush the rest)."""
@@ -1154,6 +1165,12 @@ def _liveview_session(conn, fh, idle, live=False, secs=None):
             if idle_gap and TALK.primed():          # (re)start a burst once pre-buffered
                 talk_next = now
                 dg["restarts"] += 1
+                # Each press is its own talk burst with seq from 0, like the cloud's
+                # (0..73). Continuing the count across presses, the camera played
+                # only the first press of a live view.
+                if TALK.take_new_burst() and TALK.seq_mode == "reset" and talk_seq:
+                    log(f"  talk: new press, seq {talk_seq} -> 0")
+                    talk_seq = 0
             while talk_next >= now - 0.2 and talk_next <= now + 2 * TALK_FRAME_SECS:
                 fr = TALK.pop()
                 if fr is None:
