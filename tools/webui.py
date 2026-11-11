@@ -376,7 +376,7 @@ $('talk').addEventListener('pointerdown',e=>{if(e.button)return;e.preventDefault
 $('talk').addEventListener('contextmenu',e=>e.preventDefault());
 $('talk').addEventListener('keydown',e=>{if((e.key===' '||e.key==='Enter')&&!e.repeat){e.preventDefault();talkStart();}});
 $('talk').addEventListener('keyup',e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();talkStop();}});
-window.addEventListener('blur',talkStop);
+window.addEventListener('blur',()=>{if(talk.stream)talkStop();});   // not while the mic prompt is up
 document.addEventListener('visibilitychange',()=>{if(document.hidden)talkStop();});
 
 /* ---------- snapshot ---------- */

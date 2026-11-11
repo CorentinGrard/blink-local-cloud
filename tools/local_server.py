@@ -151,6 +151,11 @@ class TalkHub:
     session thread, so the TLS socket is never written from two threads."""
     CMD = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer",
            "-f", "s16le", "-ar", "{rate}", "-ac", "1", "-i", "pipe:0",
+           # A browser mic is ~10-15 dB quieter than what the Blink app sends
+           # (speech RMS ~4-7k, peaks near full scale), too faint on the camera's
+           # small speaker. Compress + make-up gain, then limit; low latency.
+           "-af", "highpass=f=120,acompressor=threshold=0.01:ratio=6:attack=5:"
+                  "release=200:makeup=24,alimiter=limit=0.9:level=disabled",
            "-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1",
            "-flush_packets", "1", "-f", "adts", "pipe:1"]
 
