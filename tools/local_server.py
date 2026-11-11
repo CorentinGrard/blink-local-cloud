@@ -149,7 +149,11 @@ class TalkHub:
     16 kHz mono; a reader thread splits the ADTS frames into a queue that
     _liveview_session drains at real-time pace. All socket writes stay in the
     session thread, so the TLS socket is never written from two threads."""
+    # -probesize/-analyzeduration: no input probing. Without them the image's
+    # ffmpeg (7.1) holds the first ~4.4 s of every talk burst while it probes
+    # the pipe, then drops that audio -> long delay and lost words.
     CMD = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer",
+           "-probesize", "32", "-analyzeduration", "0",
            "-f", "s16le", "-ar", "{rate}", "-ac", "1", "-i", "pipe:0",
            # A browser mic is ~10-15 dB quieter than what the Blink app sends
            # (speech RMS ~4-7k, peaks near full scale), too faint on the camera's
@@ -204,6 +208,8 @@ class TalkHub:
                     buf = buf[1:]; continue
                 if len(buf) < n:
                     break
+                if n < 64 and b"Lavc" in buf[:n]:      # ffmpeg's metadata-only first frame
+                    buf = buf[n:]; continue            # (encoder name, no audio): the cloud never sends one
                 with self._lock:
                     if self.live:
                         if not self.t_frame:
