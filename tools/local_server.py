@@ -169,6 +169,8 @@ class TalkHub:
         self._rx = 0                 # PCM bytes received this burst, and its rate
         self._rate = 16000
         self._last = (None, 0.0)     # (sid, seconds received) of the last burst
+        self.dropped = 0             # frames dropped by the backlog cap (diagnostics)
+        self.t_feed = self.t_frame = 0.0   # first PCM in / first frame out, this burst
         self.live = False            # set by _liveview_session while streaming
 
     def ready(self):
@@ -181,6 +183,7 @@ class TalkHub:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
         self._proc, self._sid, self._rx, self._rate = proc, sid, 0, rate
+        self.t_feed, self.t_frame = time.time(), 0.0
         threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
         log(f"  talk: started (browser audio {rate} Hz)")
 
@@ -203,9 +206,12 @@ class TalkHub:
                     break
                 with self._lock:
                     if self.live:
+                        if not self.t_frame:
+                            self.t_frame = time.time()
+                            log(f"  talk: first encoded frame {1000 * (self.t_frame - self.t_feed):.0f} ms after first audio")
                         self._frames.append(buf[:n])
                         while len(self._frames) > TALK_MAX_BACKLOG:
-                            self._frames.popleft()
+                            self._frames.popleft(); self.dropped += 1
                 buf = buf[n:]
         proc.wait()
 
@@ -277,6 +283,9 @@ class TalkHub:
 
     def pending(self):
         return bool(self._frames)
+
+    def qlen(self):
+        return len(self._frames)
 
     def primed(self):
         """Enough queued to start a burst (or the encoder is done: flush the rest)."""
@@ -597,8 +606,27 @@ def server_ctx():
 SRV = server_ctx()
 
 
+LOG_FILE = os.path.join(LOGDIR, "server.log")   # same lines as stdout, on the media volume
+LOG_FILE_MAX = 5 * 1048576                      # rotate to server.log.1 past 5 MiB
+_log_lock = threading.Lock()
+
+
 def log(msg):
-    print(f"[{datetime.datetime.now():%H:%M:%S}] {msg}", flush=True)
+    line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
+    print(line, flush=True)
+    # Also keep it on the media volume, so the log is readable where the
+    # container's stdout isn't (e.g. without docker access on the NAS).
+    with _log_lock:
+        try:
+            if os.path.getsize(LOG_FILE) > LOG_FILE_MAX:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+        except OSError:
+            pass
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
 
 # ---------------- REST ----------------
@@ -1088,6 +1116,9 @@ def _liveview_session(conn, fh, idle, live=False, secs=None):
     next_report = time.time() + 1.0
     last_data = time.time()
     talk_seq, talk_next, talk_sent = 0, 0.0, 0
+    # talk diagnostics, logged once a second while audio flows
+    dg = {"t": time.time(), "sent": 0, "qmax": 0, "gap": 0.0, "loop": 0.0, "drop": TALK.dropped,
+          "last_send": 0.0, "last_iter": time.time(), "restarts": 0}
     TALK.set_live(True)
     conn.settimeout(0.2)
     try:
@@ -1095,6 +1126,8 @@ def _liveview_session(conn, fh, idle, live=False, secs=None):
             # Talk: send AAC frames at real-time pace (64 ms each), up to ~2 frames
             # ahead so our loop granularity never starves the camera's buffer.
             now = time.time()
+            dg["loop"] = max(dg["loop"], now - dg["last_iter"]); dg["last_iter"] = now
+            dg["qmax"] = max(dg["qmax"], TALK.qlen())
             idle_gap = talk_next < now - 0.2
             if idle_gap and talk_sent:
                 log(f"  talk: played {talk_sent} frame(s) ({talk_sent * TALK_FRAME_SECS:.1f}s)")
@@ -1103,12 +1136,23 @@ def _liveview_session(conn, fh, idle, live=False, secs=None):
                 talk_sent = 0
             if idle_gap and TALK.primed():          # (re)start a burst once pre-buffered
                 talk_next = now
+                dg["restarts"] += 1
             while talk_next >= now - 0.2 and talk_next <= now + 2 * TALK_FRAME_SECS:
                 fr = TALK.pop()
                 if fr is None:
                     break
                 conn.sendall(bytes([TALK_RECORD]) + struct.pack(">II", talk_seq, len(fr)) + fr)
                 talk_seq += 1; talk_sent += 1; talk_next += TALK_FRAME_SECS
+                t_s = time.time()
+                if dg["last_send"]:
+                    dg["gap"] = max(dg["gap"], t_s - dg["last_send"])
+                dg["last_send"] = t_s; dg["sent"] += 1
+            if now - dg["t"] >= 1.0:
+                if dg["sent"] or dg["qmax"] or TALK.dropped != dg["drop"]:
+                    log(f"  talk/s: sent={dg['sent']} seq={talk_seq} q_max={dg['qmax']} "
+                        f"max_gap={1000 * dg['gap']:.0f}ms loop_max={1000 * dg['loop']:.0f}ms "
+                        f"dropped={TALK.dropped - dg['drop']} restarts={dg['restarts']}")
+                dg.update(t=now, sent=0, qmax=0, gap=0.0, loop=0.0, drop=TALK.dropped, restarts=0)
             conn.settimeout(0.02 if TALK.pending() else 0.2)
             if os.path.exists(MEDIA_STOP):
                 log("  liveview: stop requested")
