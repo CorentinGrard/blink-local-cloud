@@ -315,47 +315,68 @@ setInterval(()=>{
    raw 16-bit PCM in ~100 ms POSTs (in order); the server encodes it to AAC and
    writes it into the live-view stream. Live sound is muted while talking so the
    camera's mic doesn't feed your voice back to you. */
-const talk={on:false,stream:null,ctx:null,node:null,src:null,sid:'',buf:[],n:0,q:Promise.resolve(),wasMuted:true,warned:false};
+const talk={on:false,stream:null,ctx:null,ready:null,node:null,src:null,sink:null,sid:'',buf:[],n:0,
+  q:Promise.resolve(),wasMuted:true,warned:false,peak:0,maxPeak:0,samples:0};
 const TALK_WORKLET="registerProcessor('pcm-tap',class extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true}})";
 function talkUI(){$('talk').classList.toggle('on',talk.on);
   $('talk').innerHTML=talk.on?'__I_mic__ Talking… release to stop':'__I_mic__ Hold to talk';}
+function talkHint(msg,bad){$('vmsg').textContent=msg;$('vmsg').className='hint'+(bad?' bad':'');}
 function talkSend(path,body){
   talk.q=talk.q.then(()=>fetch(path,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body}))
     .then(r=>{if(!r.ok&&!talk.warned){talk.warned=true;
-      toast(r.status===409?'Live view isn’t running.':r.status===503?'Talk needs ffmpeg on the server.':'Could not send audio.','bad');talkStop();}})
-    .catch(()=>{});}
+      toast(r.status===409?'Live view isn’t running.':r.status===503?'Talk needs ffmpeg on the server.':'Could not send audio ('+r.status+').','bad');talkStop();}})
+    .catch(()=>{if(!talk.warned){talk.warned=true;toast('Could not send audio to the server.','bad');}});}
 function talkFlush(){
   if(!talk.n||!talk.ctx)return;
   const out=new Int16Array(talk.n);let o=0;for(const b of talk.buf){out.set(b,o);o+=b.length;}
-  talk.buf=[];talk.n=0;
+  talk.samples+=talk.n;talk.buf=[];talk.n=0;
   talkSend('/api/talk?sid='+talk.sid+'&rate='+talk.ctx.sampleRate,out.buffer);
+  if(talk.on){const k=Math.min(10,Math.round(Math.sqrt(talk.peak)*10));     // mic level meter
+    talkHint('Mic '+'▮'.repeat(k)+'▯'.repeat(10-k));talk.peak=0;}
 }
-async function talkStart(){
+function talkCtx(){
+  // Create and resume the AudioContext inside the button press itself: Safari/iOS
+  // keep a context created later (after the mic prompt) suspended -> no audio.
+  if(!talk.ctx){const AC=window.AudioContext||window.webkitAudioContext;talk.ctx=new AC();
+    talk.ready=talk.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([TALK_WORKLET],{type:'application/javascript'})));}
+  if(talk.ctx.state!=='running')talk.ctx.resume().catch(()=>{});
+  return talk.ready;
+}
+function talkStart(){
   if(talk.on||lv.state!=='playing')return;
   if(!window.isSecureContext||!navigator.mediaDevices||!window.AudioWorkletNode){
     toast('Talking needs the dashboard opened over HTTPS in a recent browser.','bad');return;}
-  talk.on=true;talk.warned=false;talk.sid=Math.random().toString(36).slice(2,12);talkUI();
+  let ready;
+  try{ready=talkCtx();}catch(e){toast('This browser can’t capture audio.','bad');return;}
+  talk.on=true;talk.warned=false;talk.samples=0;talk.peak=0;talk.maxPeak=0;
+  talk.sid=Math.random().toString(36).slice(2,12);talkUI();talkHint('Opening the microphone…');
   const v=$('vid');talk.wasMuted=v.muted;v.muted=true;muteLabel();
+  talkOpen(ready);
+}
+async function talkOpen(ready){
   try{
     const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
     if(!talk.on){stream.getTracks().forEach(t=>t.stop());return;}     // released while asking
     talk.stream=stream;
-    if(!talk.ctx){talk.ctx=new AudioContext();
-      await talk.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([TALK_WORKLET],{type:'application/javascript'})));}
-    if(talk.ctx.state==='suspended')await talk.ctx.resume();
+    await ready;
+    if(talk.ctx.state!=='running')await talk.ctx.resume();
     if(!talk.on){talkStop();return;}
-    talk.src=talk.ctx.createMediaStreamSource(stream);
-    talk.node=new AudioWorkletNode(talk.ctx,'pcm-tap');
-    const chunk=Math.round(talk.ctx.sampleRate/10);                   // ~100 ms per POST
+    const ctx=talk.ctx,chunk=Math.round(ctx.sampleRate/10);           // ~100 ms per POST
+    talk.src=ctx.createMediaStreamSource(stream);
+    talk.node=new AudioWorkletNode(ctx,'pcm-tap');
     talk.node.port.onmessage=e=>{
       if(!talk.on)return;
       const f=e.data,s=new Int16Array(f.length);
-      for(let i=0;i<f.length;i++){const x=Math.max(-1,Math.min(1,f[i]));s[i]=x<0?x*0x8000:x*0x7fff;}
+      for(let i=0;i<f.length;i++){const x=Math.max(-1,Math.min(1,f[i])),a=x<0?-x:x;
+        if(a>talk.peak)talk.peak=a;if(a>talk.maxPeak)talk.maxPeak=a;s[i]=x<0?x*0x8000:x*0x7fff;}
       talk.buf.push(s);talk.n+=s.length;if(talk.n>=chunk)talkFlush();
     };
-    talk.src.connect(talk.node);       // not connected to the speakers: no local echo
+    // The audio graph only runs nodes that lead to the output, so route the tap
+    // there through a muted gain (silent: no local echo).
+    talk.sink=ctx.createGain();talk.sink.gain.value=0;
+    talk.src.connect(talk.node);talk.node.connect(talk.sink);talk.sink.connect(ctx.destination);
   }catch(e){
-    toast(e&&e.name==='NotAllowedError'?'Microphone access was blocked.':'Could not open the microphone.','bad');
+    toast(e&&e.name==='NotAllowedError'?'Microphone access was blocked.':'Could not open the microphone'+(e&&e.name?' ('+e.name+')':'')+'.','bad');
     talkStop();
   }
 }
@@ -363,11 +384,20 @@ function talkStop(){
   if(!talk.on&&!talk.stream)return;
   const was=talk.on;talk.on=false;
   talkFlush();
-  if(talk.node){talk.node.port.onmessage=null;try{talk.node.disconnect()}catch(e){}talk.node=null;}
-  if(talk.src){try{talk.src.disconnect()}catch(e){}talk.src=null;}
+  for(const k of ['node','src','sink'])if(talk[k]){try{talk[k].disconnect()}catch(e){}talk[k]=null;}
   if(talk.stream){talk.stream.getTracks().forEach(t=>t.stop());talk.stream=null;}
-  if(was){if(talk.sid)talkSend('/api/talk?sid='+talk.sid+'&end=1',new ArrayBuffer(0));
-    $('vid').muted=talk.wasMuted;muteLabel();}
+  if(was){
+    const secs=talk.ctx?talk.samples/talk.ctx.sampleRate:0,peak=talk.maxPeak,sid=talk.sid;
+    $('vid').muted=talk.wasMuted;muteLabel();
+    talk.q=talk.q.then(()=>fetch('/api/talk?sid='+sid+'&end=1',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:new ArrayBuffer(0)}))
+      .then(r=>r.json()).catch(()=>({}))
+      .then(j=>{
+        if(talk.on||talk.warned)return;
+        if(secs<0.05)talkHint('No audio came from your microphone. Check the browser’s mic permission.',true);
+        else if(peak<0.003)talkHint('Your microphone is silent. Check the input device or whether it is muted.',true);
+        else talkHint('Sent '+secs.toFixed(1)+' s to the camera'+(j.rx_secs!=null?' (server got '+j.rx_secs.toFixed(1)+' s)':'')+'.');
+      });
+  }
   talkUI();
 }
 $('talk').addEventListener('pointerdown',e=>{if(e.button)return;e.preventDefault();
@@ -1010,7 +1040,7 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 if not talk or not re.fullmatch(r"[A-Za-z0-9]{1,32}", sid):
                     return self._json({"msg": "bad request"}, 400)
                 if q.get("end"):
-                    talk.end(sid); return self._json({"ok": True})
+                    return self._json({"ok": True, "rx_secs": talk.end(sid)})
                 if not talk.ready():
                     return self._json({"msg": "ffmpeg not installed"}, 503)
                 try: rate = int(q.get("rate", 0))

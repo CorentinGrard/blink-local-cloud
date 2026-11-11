@@ -166,6 +166,9 @@ class TalkHub:
         self._proc = None
         self._sid = None
         self._last_feed = 0.0
+        self._rx = 0                 # PCM bytes received this burst, and its rate
+        self._rate = 16000
+        self._last = (None, 0.0)     # (sid, seconds received) of the last burst
         self.live = False            # set by _liveview_session while streaming
 
     def ready(self):
@@ -177,7 +180,7 @@ class TalkHub:
         cmd = [a.replace("{rate}", str(rate)) for a in self.CMD]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
-        self._proc, self._sid = proc, sid
+        self._proc, self._sid, self._rx, self._rate = proc, sid, 0, rate
         threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
         log(f"  talk: started (browser audio {rate} Hz)")
 
@@ -212,8 +215,11 @@ class TalkHub:
                 self._proc.stdin.close()      # EOF: ffmpeg flushes its last frames and exits
             except Exception:
                 pass
+            secs = self._rx / 2 / self._rate
+            self._last = (self._sid, secs)
             self._proc, self._sid = None, None
-            log("  talk: ended")
+            log(f"  talk: ended ({secs:.1f}s of browser audio received)")
+            set_state(talk_rx={"secs": round(secs, 2), "rate": self._rate, "ts": time.time()})
 
     def feed(self, sid, rate, pcm):
         """Queue browser PCM for the camera. False when no live view is running."""
@@ -224,6 +230,7 @@ class TalkHub:
                 self._stop_locked()
                 self._start(sid, rate)
             self._last_feed = time.time()
+            self._rx += len(pcm)
             proc = self._proc
         try:
             proc.stdin.write(pcm); proc.stdin.flush()
@@ -235,9 +242,11 @@ class TalkHub:
         return True
 
     def end(self, sid=None):
+        """Close a talk burst; returns the seconds of browser audio it received."""
         with self._lock:
             if sid is None or sid == self._sid:
                 self._stop_locked()
+            return self._last[1] if self._last[0] == sid else 0.0
 
     def pop(self):
         """Next AAC frame to send, or None. Also ends a burst the browser abandoned."""
@@ -1069,6 +1078,8 @@ def _liveview_session(conn, fh, idle, live=False, secs=None):
             idle_gap = talk_next < now - 0.2
             if idle_gap and talk_sent:
                 log(f"  talk: played {talk_sent} frame(s) ({talk_sent * TALK_FRAME_SECS:.1f}s)")
+                set_state(talk_played={"frames": talk_sent, "secs": round(talk_sent * TALK_FRAME_SECS, 2),
+                                       "ts": time.time()})
                 talk_sent = 0
             if idle_gap and TALK.primed():          # (re)start a burst once pre-buffered
                 talk_next = now
