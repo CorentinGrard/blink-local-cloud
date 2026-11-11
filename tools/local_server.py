@@ -15,30 +15,28 @@ next command-poll (0x0806) long-poll will return its bytes instead of the empty
 ack, then the file is moved to tools/queue/sent/. This is how we experiment with
 liveview/snapshot commands and watch the camera react.
 """
-import os, re, ssl, socket, struct, time, threading, datetime, glob, json
-import urllib.request
+import os, ssl, socket, struct, time, threading, datetime, glob, json
 import blink_proto as bp
-import media_watch
+import common
+from common import (DEBUG, HERE, LOGDIR, MEDIA_REQ, MEDIA_STOP, ROOT, bump_seen,
+                    get_state, log, log_error, set_state)
+from liveview import LIVE_HUB, capture_media
+from talk import TALK
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+# the command logic's view of the current media request (shared with liveview)
+_media = common.media
+
 CHAIN = os.path.join(ROOT, "certs/v2/chain-dup.pem")
 KEY   = os.path.join(ROOT, "certs/v2/my-ca2-key.pem")
 TPL   = os.path.join(HERE, "templates")
 QUEUE = os.path.join(HERE, "queue"); os.makedirs(os.path.join(QUEUE, "sent"), exist_ok=True)
-LOGDIR = os.path.join(ROOT, "mitm", "local"); os.makedirs(LOGDIR, exist_ok=True)
 
 LISTEN = ("0.0.0.0", int(os.environ.get("BLINK_PORT", "8080")))
-# BLINK_DEBUG=1 keeps protocol-debugging captures: raw camera uploads (*_0804.bin),
-# the intermediate .ts once the .mp4 exists, every decrypted connection under
-# flows/ and every 0x0806 poll under polls/. Off (default): only the playable
-# media is kept (.jpg snapshots, .mp4 clips + .thumb.jpg).
-DEBUG = os.environ.get("BLINK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
 HEARTBEAT = open(os.path.join(TPL, "heartbeat_0807.bin"), "rb").read()
 BUNDLE    = open(os.path.join(TPL, "bundle.bin"), "rb").read()
 MEDIA_REPLY = open(os.path.join(TPL, "media_reply_0804.bin"), "rb").read()          # liveview session config
 # Real cloud liveview opening (28B header + 9B timestamp + 145B session config),
-# captured 2026-10-12 via the relay; see _capture_media for the rest of the exchange.
+# captured 2026-10-12 via the relay; see liveview.capture_media for the rest of the exchange.
 MEDIA_REPLY_LIVE = open(os.path.join(TPL, "media_reply_live_0804.bin"), "rb").read()
 MEDIA_REPLY_SNAP = open(os.path.join(TPL, "media_reply_snapshot_0804.bin"), "rb").read()  # snapshot session config
 CONFIG    = open(os.path.join(TPL, "config_0807.bin"), "rb").read()  # 174B post-onboarding config-fetch reply
@@ -49,10 +47,6 @@ ARM_TPL   = open(os.path.join(TPL, "arm_0806.bin"), "rb").read()             # 0
 SETTINGS_FILE = os.path.join(LOGDIR, "settings.json")
 _bundle_served = {"done": False}
 
-# live state published for tools/console.py (connection status + last capture)
-STATE_FILE = os.path.join(LOGDIR, "state.json")
-_state = {"onboarded": False, "req_count": 0}
-_state_lock = threading.Lock()
 
 
 # --- rolling media retention -------------------------------------------------
@@ -98,297 +92,16 @@ def _prune_old_media():
 def _retention_janitor():
     while True:                          # prune at startup, then hourly
         try: _prune_old_media()
-        except Exception as e: log(f"(retention error: {e})")
+        except Exception as e: log_error("retention", e)    # keep the janitor alive
         time.sleep(3600)
 
 
-class LiveHub:
-    """Fan-out of the live, de-chunked MPEG-TS to browser subscribers (webui.py /live.ts)."""
-    def __init__(self):
-        self._subs = set()
-        self._lock = threading.Lock()
-    def subscribe(self):
-        import queue as _q
-        q = _q.Queue(maxsize=1024)
-        with self._lock:
-            self._subs.add(q)
-        return q
-    def unsubscribe(self, q):
-        with self._lock:
-            self._subs.discard(q)
-    def publish(self, data):
-        with self._lock:
-            subs = list(self._subs)
-        for q in subs:
-            try:
-                q.put_nowait(data)
-            except Exception:
-                pass          # slow/stalled browser: drop rather than block the camera
-LIVE_HUB = LiveHub()
 
 
-# ---- two-way talk (browser mic -> camera speaker) -------------------------
-# During a live view the camera plays any audio the server writes back on the
-# same 0x0804 socket: records `05 <seq:u32> <len:u32> <ADTS frame>`, AAC-LC
-# 16 kHz mono, one 1024-sample frame (64 ms) per record, seq from 0 per session
-# (relay capture of the real cloud, 2026-11-11). No command or setting is
-# involved; the rest of the session is the normal live view.
-TALK_FRAME_SECS = 1024 / 16000
-TALK_RECORD = 0x05
-TALK_MAX_BACKLOG = 40          # frames (~2.5 s) queued before we drop the oldest
-TALK_IDLE = 3.0                # s without browser audio -> end the talk burst
-TALK_PREBUFFER = 5             # frames (~320 ms) to queue before a burst starts playing,
-                               # so encoder/network jitter doesn't starve the speaker
 
 
-class TalkHub:
-    """Browser mic -> AAC frames for the live-view session to send.
-
-    webui.py posts raw PCM (s16le mono, at the browser's own sample rate) with a
-    talk-session id. One ffmpeg process per talk burst encodes it to ADTS AAC-LC
-    16 kHz mono; a reader thread splits the ADTS frames into a queue that
-    _liveview_session drains at real-time pace. All socket writes stay in the
-    session thread, so the TLS socket is never written from two threads."""
-    # -probesize/-analyzeduration: no input probing. Without them the image's
-    # ffmpeg (7.1) holds the first ~4.4 s of every talk burst while it probes
-    # the pipe, then drops that audio -> long delay and lost words.
-    CMD = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer",
-           "-probesize", "32", "-analyzeduration", "0",
-           "-f", "s16le", "-ar", "{rate}", "-ac", "1", "-i", "pipe:0",
-           # A browser mic is ~10-15 dB quieter than what the Blink app sends
-           # (speech RMS ~4-7k, peaks near full scale), too faint on the camera's
-           # small speaker. Compress + make-up gain, then limit; low latency.
-           "-af", "highpass=f=120,acompressor=threshold=0.01:ratio=6:attack=5:"
-                  "release=200:makeup=24,alimiter=limit=0.9:level=disabled",
-           "-c:a", "aac", "-b:a", "32k", "-ar", "16000", "-ac", "1",
-           "-flush_packets", "1", "-f", "adts", "pipe:1"]
-
-    def __init__(self):
-        import collections
-        self._lock = threading.Lock()
-        self._frames = collections.deque()
-        self._proc = None
-        self._sid = None
-        self._last_feed = 0.0
-        self._rx = 0                 # PCM bytes received this burst, and its rate
-        self._rate = 16000
-        self._last = (None, 0.0)     # (sid, seconds received) of the last burst
-        self.dropped = 0             # frames dropped by the backlog cap (diagnostics)
-        self.t_feed = self.t_frame = 0.0   # first PCM in / first frame out, this burst
-        self.live = False            # set by _liveview_session while streaming
-        self._new_burst = False      # a talk press started; its records restart at seq 0
-        self.seq_mode = "reset"      # "reset" per press (default) | "continue" (diagnostics)
-
-    def ready(self):
-        import shutil
-        return bool(shutil.which("ffmpeg"))
-
-    def _start(self, sid, rate):
-        import subprocess
-        cmd = [a.replace("{rate}", str(rate)) for a in self.CMD]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL)
-        self._proc, self._sid, self._rx, self._rate = proc, sid, 0, rate
-        self.t_feed, self.t_frame = time.time(), 0.0
-        self._new_burst = True
-        # BLINK_DEBUG: keep each press's encoded audio (talk_<time>.aac) so a
-        # problem can be replayed exactly via /api/talk?format=adts
-        rec = None
-        if DEBUG:
-            try:
-                rec = open(os.path.join(LOGDIR, f"talk_{datetime.datetime.now():%Y%m%d-%H%M%S}.aac"), "wb")
-            except OSError:
-                pass
-        threading.Thread(target=self._reader, args=(proc, rec), daemon=True).start()
-        log(f"  talk: started (browser audio {rate} Hz)")
-
-    def _reader(self, proc, rec=None):
-        buf = b""
-        while True:
-            d = proc.stdout.read1(4096)
-            if not d:
-                break
-            buf += d
-            while len(buf) >= 7:
-                if buf[0] != 0xFF or buf[1] & 0xF0 != 0xF0:      # resync on the 0xFFF syncword
-                    i = buf.find(b"\xff", 1)
-                    buf = buf[i:] if i > 0 else b""
-                    continue
-                n = ((buf[3] & 3) << 11) | (buf[4] << 3) | (buf[5] >> 5)
-                if n < 7:
-                    buf = buf[1:]; continue
-                if len(buf) < n:
-                    break
-                if n < 64 and b"Lavc" in buf[:n]:      # ffmpeg's metadata-only first frame
-                    buf = buf[n:]; continue            # (encoder name, no audio): the cloud never sends one
-                if rec:
-                    try: rec.write(buf[:n])
-                    except OSError: pass
-                with self._lock:
-                    if self.live:
-                        if not self.t_frame:
-                            self.t_frame = time.time()
-                            log(f"  talk: first encoded frame {1000 * (self.t_frame - self.t_feed):.0f} ms after first audio")
-                        self._frames.append(buf[:n])
-                        while len(self._frames) > TALK_MAX_BACKLOG:
-                            self._frames.popleft(); self.dropped += 1
-                buf = buf[n:]
-        proc.wait()
-        if rec:
-            rec.close()
-
-    def _stop_locked(self):
-        if self._proc:
-            try:
-                self._proc.stdin.close()      # EOF: ffmpeg flushes its last frames and exits
-            except Exception:
-                pass
-            secs = self._rx / 2 / self._rate
-            self._last = (self._sid, secs)
-            self._proc, self._sid = None, None
-            log(f"  talk: ended ({secs:.1f}s of browser audio received)")
-            set_state(talk_rx={"secs": round(secs, 2), "rate": self._rate, "ts": time.time()})
-
-    def feed(self, sid, rate, pcm):
-        """Queue browser PCM for the camera. False when no live view is running."""
-        with self._lock:
-            if not self.live:
-                self._stop_locked(); return False
-            if self._sid != sid or not self._proc or self._proc.poll() is not None:
-                self._stop_locked()
-                self._start(sid, rate)
-            self._last_feed = time.time()
-            self._rx += len(pcm)
-            proc = self._proc
-        try:
-            proc.stdin.write(pcm); proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            with self._lock:
-                if self._proc is proc:
-                    self._proc, self._sid = None, None
-            return False
-        return True
-
-    def feed_adts(self, data):
-        """Queue ready-made ADTS AAC (16 kHz mono) as-is, all of it: plays a
-        pre-encoded clip, and lets us test the camera with exact frames
-        (e.g. the real cloud's captured talk audio). False if not live."""
-        frames, i = [], 0
-        while i + 7 <= len(data):
-            if data[i] != 0xFF or data[i + 1] & 0xF0 != 0xF0:
-                i += 1; continue
-            n = ((data[i + 3] & 3) << 11) | (data[i + 4] << 3) | (data[i + 5] >> 5)
-            if n < 7 or i + n > len(data):
-                break
-            frames.append(data[i:i + n]); i += n
-        with self._lock:
-            if not self.live:
-                return False
-            self._stop_locked()
-            self._frames.clear()
-            self._frames.extend(frames)
-            self._new_burst = True
-        log(f"  talk: queued {len(frames)} pre-encoded frame(s)")
-        return True
-
-    def end(self, sid=None):
-        """Close a talk burst; returns the seconds of browser audio it received."""
-        with self._lock:
-            if sid is None or sid == self._sid:
-                self._stop_locked()
-            return self._last[1] if self._last[0] == sid else 0.0
-
-    def pop(self):
-        """Next AAC frame to send, or None. Also ends a burst the browser abandoned."""
-        with self._lock:
-            if self._proc and time.time() - self._last_feed > TALK_IDLE:
-                self._stop_locked()
-            return self._frames.popleft() if self._frames else None
-
-    def pending(self):
-        return bool(self._frames)
-
-    def qlen(self):
-        return len(self._frames)
-
-    def take_new_burst(self):
-        """True once per talk press: the session then restarts the record seq at 0."""
-        with self._lock:
-            nb, self._new_burst = self._new_burst, False
-            return nb
-
-    def primed(self):
-        """Enough queued to start a burst (or the encoder is done: flush the rest)."""
-        with self._lock:
-            if self._proc and time.time() - self._last_feed > TALK_IDLE:
-                self._stop_locked()                      # browser went away mid-talk
-            return len(self._frames) >= TALK_PREBUFFER or (
-                bool(self._frames) and (not self._proc or self._proc.poll() is not None))
-
-    def set_live(self, on):
-        with self._lock:
-            self.live = on
-            if not on:
-                self._stop_locked()
-                self._frames.clear()
-TALK = TalkHub()
 
 
-def _flush_state(data):
-    try:
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(data)
-        os.replace(tmp, STATE_FILE)      # atomic: readers never see a partial file
-    except Exception:
-        pass
-
-
-def bump_seen(ip, opcode=None, action=None):
-    """Record that the camera just talked to us (drives console's connected/stale)."""
-    with _state_lock:
-        _state["ip"] = ip
-        _state["last_seen"] = time.time()
-        _state["last_seen_str"] = datetime.datetime.now().strftime("%H:%M:%S")
-        if opcode is not None:
-            _state["last_opcode"] = f"0x{opcode:04x}"
-        if action is not None:
-            _state["last_action"] = action
-        _state["req_count"] = _state.get("req_count", 0) + 1
-        data = json.dumps(_state)
-    _flush_state(data)
-
-
-def set_state(**kw):
-    with _state_lock:
-        _state.update(kw)
-        data = json.dumps(_state)
-    _flush_state(data)
-
-
-def _to_mp4(ts_path):
-    """Remux a liveview MPEG-TS (H.264 + AAC) into .mp4 without re-encoding --
-    ffmpeg -c copy, else GStreamer (tsdemux -> mp4mux, video only). Neither decodes, so the
-    missing native H.264 decoder doesn't matter. Returns the mp4 path or None."""
-    import shutil, subprocess
-    mp4 = os.path.splitext(ts_path)[0] + ".mp4"
-    cmds = []
-    if shutil.which("ffmpeg"):
-        cmds.append(["ffmpeg", "-y", "-loglevel", "error", "-i", ts_path,
-                     "-c", "copy", "-movflags", "+faststart", mp4])
-    if shutil.which("gst-launch-1.0"):
-        # video only: the camera's AAC won't negotiate into mp4mux here
-        cmds.append(["gst-launch-1.0", "-q", "-e", "filesrc", f"location={ts_path}", "!",
-                     "tsdemux", "!", "queue", "!", "h264parse", "!",
-                     "mp4mux", "faststart=true", "!", "filesink", f"location={mp4}"])
-    for cmd in cmds:
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=120)
-            if r.returncode == 0 and os.path.exists(mp4) and os.path.getsize(mp4) > 0:
-                return mp4
-        except Exception:
-            pass
-    return None
 
 
 _settings_cache = {}
@@ -406,7 +119,7 @@ def get_settings():
         _settings_cache["last_good"] = override
     except FileNotFoundError:
         pass
-    except Exception:
+    except (OSError, ValueError):
         # unreadable/corrupt file: keep the last good overrides rather than
         # pushing template defaults (which would e.g. disarm an armed camera)
         override = _settings_cache.get("last_good", {})
@@ -454,80 +167,6 @@ MEDIA_IP = os.environ.get("BLINK_MEDIA_IP", "10.10.10.1")
 # MEDIA_IP so it uploads the clip to us. Cooldown avoids re-granting the same clip.
 _motion = {"last_grant": 0.0}
 MOTION_COOLDOWN = float(os.environ.get("BLINK_MOTION_COOLDOWN", "35"))  # s between motion-clip grants
-# ntfy push on motion. The topic is a secret (anyone with it can read/publish), so
-# it's never baked into the image/compose: the server reads it from a file
-# (BLINK_NTFY_TOPIC_FILE, mounted read-only) or BLINK_NTFY_TOPIC. No topic => off.
-NTFY_URL = os.environ.get("BLINK_NTFY_URL", "https://ntfy.sh").rstrip("/")
-NTFY_TOPIC_FILE = os.environ.get("BLINK_NTFY_TOPIC_FILE", "/app/ntfy-topic")
-
-def _ntfy_topic():
-    t = os.environ.get("BLINK_NTFY_TOPIC", "").strip()
-    if t:
-        return t
-    try:
-        return open(NTFY_TOPIC_FILE).read().strip()
-    except Exception:
-        return ""
-
-def notify_motion():
-    """Fire-and-forget ntfy notification that motion was detected."""
-    topic = _ntfy_topic()
-    if not topic:
-        return
-
-    def _send():
-        try:
-            req = urllib.request.Request(
-                f"{NTFY_URL}/{topic}",
-                data="Motion detected by the Blink camera".encode(),
-                # NB: urllib encodes headers as latin-1, so keep header values
-                # ASCII (an em-dash etc. raises and the POST never goes out).
-                headers={"Title": "Blink: motion detected",
-                         "Priority": "high",
-                         "Tags": "rotating_light"})
-            urllib.request.urlopen(req, timeout=10).read()
-        except Exception as e:
-            log(f"  (ntfy notify failed: {e})")
-
-    threading.Thread(target=_send, daemon=True).start()
-
-# The motion push is sent once the clip has been uploaded, with its snapshot
-# attached (ntfy shows image attachments inline). Tapping it opens BLINK_NTFY_CLICK
-# (default: the dashboard). No snapshot => falls back to the text-only notify_motion.
-NTFY_CLICK = os.environ.get("BLINK_NTFY_CLICK", "https://blink.lan").strip()
-# Base URL the "Watch clip" button points at (the dashboard's /clips/ route).
-CLIP_BASE_URL = os.environ.get("BLINK_CLIP_BASE_URL", "https://blink.lan").rstrip("/")
-
-def notify_motion_snapshot(jpg_path, when=None, clip_path=None):
-    """Fire-and-forget ntfy motion notification with the clip's thumbnail attached."""
-    topic = _ntfy_topic()
-    if not topic:
-        return
-    when = when or datetime.datetime.now().strftime("%H:%M:%S")
-
-    def _send():
-        try:
-            body = open(jpg_path, "rb").read()
-            # The body IS the attachment, so the text goes in the Message header
-            # (ASCII only, see notify_motion).
-            headers = {"Title": "Blink: motion detected",
-                       "Message": f"Motion at {when}",
-                       "Filename": "motion.jpg",
-                       "Priority": "high",
-                       "Tags": "rotating_light"}
-            if NTFY_CLICK:
-                headers["Click"] = NTFY_CLICK
-            if clip_path and CLIP_BASE_URL:
-                # ntfy action button; opens the MP4 in the phone's browser/player
-                clip_url = f"{CLIP_BASE_URL}/clips/{os.path.basename(clip_path)}"
-                headers["Actions"] = f"view, Watch clip, {clip_url}"
-            req = urllib.request.Request(f"{NTFY_URL}/{topic}", data=body,
-                                         headers=headers, method="PUT")
-            urllib.request.urlopen(req, timeout=20).read()
-        except Exception as e:
-            log(f"  (ntfy snapshot notify failed: {e})")
-
-    threading.Thread(target=_send, daemon=True).start()
 _LATENCY = float(os.environ.get("BLINK_LATENCY", "0") or "0")   # artificial reply RTT (s)
 # 0x0806 is a long-poll: after the per-message acks the real cloud keeps it open
 # until the camera closes it (~10s); commands can be pushed meanwhile.
@@ -546,12 +185,10 @@ POLL_HOLD = float(os.environ.get("BLINK_POLL_HOLD", "15.0"))  # max 0x0806 long-
 # snapshot command, which is why liveview requests came back as JPEGs.
 # Driven by mitm/local/media_request.json (console.py writes {"mode","ip","ts"});
 # the request clears when the 0x0804 upload starts.
-MEDIA_REQ = os.path.join(LOGDIR, "media_request.json")
 MEDIA_REQ_TTL = 60.0        # a request older than this is abandoned
 MEDIA_MAX_SENDS = 12        # command sends per request (in-poll retries count too)
 POLL_RETRIES = 5            # immediate resends after a "03" refusal, per poll (2 seen needed)
 SNAP_TPL = ARM_TPL
-_media = {"active": False}
 
 
 # Command Kt seq: the cloud numbers commands with one ever-increasing counter
@@ -565,13 +202,18 @@ SEQ_START = 0x0230
 
 def _next_seq():
     try:
-        seq = int(json.load(open(SEQ_FILE))["next"])
-    except Exception:
+        with open(SEQ_FILE) as f:
+            seq = int(json.load(f)["next"])
+    except FileNotFoundError:
+        seq = SEQ_START
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        log(f"  ({SEQ_FILE} unreadable ({e}); restarting command seq at 0x{SEQ_START:04x})")
         seq = SEQ_START
     try:
-        json.dump({"next": (seq + 1) & 0xffff}, open(SEQ_FILE, "w"))
-    except Exception:
-        pass
+        with open(SEQ_FILE, "w") as f:
+            json.dump({"next": (seq + 1) & 0xffff}, f)
+    except OSError as e:
+        log(f"  (cannot save command seq: {e})")
     return seq
 
 
@@ -579,8 +221,9 @@ def _media_poll(poll_len, poll_seq):
     """Decide the 0x0806 reply when a media request is active. Returns the command
     bytes to send, or None if there is no active request (fall back to queue/idle)."""
     try:
-        req = json.load(open(MEDIA_REQ))
-    except Exception:
+        with open(MEDIA_REQ) as f:
+            req = json.load(f)
+    except (FileNotFoundError, ValueError):   # none, or caught mid-write: next poll
         req = None
     now = time.time()
     if not req or now - req.get("ts", 0) > MEDIA_REQ_TTL:
@@ -610,13 +253,6 @@ def _media_poll(poll_len, poll_seq):
     return bp.set_media_ip(bp.set_kt_seq(START_TPL, seq), _media["ip"])
 
 
-def _clear_media_request():
-    try:
-        os.remove(MEDIA_REQ)
-    except Exception:
-        pass
-    _media["active"] = False
-
 
 def ts_patch(hb):
     """Refresh the timestamp (offset 28: YYYY MM DD HH MM SS) to 'now'."""
@@ -633,30 +269,9 @@ def server_ctx():
     try: ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
     except ssl.SSLError: pass
     return ctx
-SRV = server_ctx()
+SRV = None          # created in main(): importing this module needs no CA key (tests)
 
 
-LOG_FILE = os.path.join(LOGDIR, "server.log")   # same lines as stdout, on the media volume
-LOG_FILE_MAX = 5 * 1048576                      # rotate to server.log.1 past 5 MiB
-_log_lock = threading.Lock()
-
-
-def log(msg):
-    line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
-    print(line, flush=True)
-    # Also keep it on the media volume, so the log is readable where the
-    # container's stdout isn't (e.g. without docker access on the NAS).
-    with _log_lock:
-        try:
-            if os.path.getsize(LOG_FILE) > LOG_FILE_MAX:
-                os.replace(LOG_FILE, LOG_FILE + ".1")
-        except OSError:
-            pass
-        try:
-            with open(LOG_FILE, "a") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass
 
 
 # ---------------- REST ----------------
@@ -729,8 +344,8 @@ def handle_rest(conn, first, peer):
                 buf += more
             reqbody = buf[:clen]; buf = buf[clen:]
             log(f"REST {peer[0]}  {line}")
-            try: method, path, _ = line.split(" ", 2)
-            except ValueError: method, path = "GET", "/"
+            try: _method, path, _ = line.split(" ", 2)
+            except ValueError: path = "/"
             p = path.split("?", 1)[0]
             bump_seen(peer[0], action=f"REST {p}")
             if p == "/api/v1/owl/status":
@@ -813,9 +428,10 @@ def handle_cs(conn, first, peer):
     if DEBUG and opcode == 0x0806:   # save the raw poll so we can diff it vs the real cloud
         try:
             pd = os.path.join(LOGDIR, "polls"); os.makedirs(pd, exist_ok=True)
-            open(os.path.join(pd, f"{datetime.datetime.now():%H%M%S}_{len(data)}B_0806.bin"), "wb").write(data)
-        except Exception:
-            pass
+            with open(os.path.join(pd, f"{datetime.datetime.now():%H%M%S}_{len(data)}B_0806.bin"), "wb") as f:
+                f.write(data)
+        except OSError as e:
+            log(f"  (cannot save poll: {e})")
 
     if opcode == 0x0806:                      # command poll (long-poll)
         poll_seq = bp._kt_seq(data)           # camera's live media-session seq, if any
@@ -832,11 +448,8 @@ def handle_cs(conn, first, peer):
         # try to force re-init. Opt-in so it can't silently break the onboard loop.
         hollow = (poll_seq is None) and len(data) < 200
         if os.environ.get("BLINK_EMPTY_HOLLOW") == "1" and hollow and not _media.get("active"):
-            try:
-                if not os.path.exists(MEDIA_REQ):
-                    log(f"  hollow poll ({len(data)}B) -> replying EMPTY (0B) to force re-init [experiment]")
-                    return
-            except Exception:
+            if not os.path.exists(MEDIA_REQ):
+                log(f"  hollow poll ({len(data)}B) -> replying EMPTY (0B) to force re-init [experiment]")
                 return
         # The acks were sent per camera message by converse_0806. Now hold the
         # poll open like the real cloud (until the camera closes it, ~10s) and push
@@ -905,13 +518,13 @@ def handle_cs(conn, first, peer):
                         _motion["last_grant"] = time.time()
                         secs = int(get_settings().get("clip_len", 30))
                         try:
-                            json.dump({"mode": "liveview", "ip": MEDIA_IP, "live": True,
-                                       "secs": secs, "ts": time.time(), "motion": True},
-                                      open(MEDIA_REQ, "w"))
+                            with open(MEDIA_REQ, "w") as f:
+                                json.dump({"mode": "liveview", "ip": MEDIA_IP, "live": True,
+                                           "secs": secs, "ts": time.time(), "motion": True}, f)
                             log(f"  >> MOTION detected -> requesting {secs}s clip upload to {MEDIA_IP}")
                             # ntfy push is sent after the clip upload, with its snapshot
                             pushed = False     # re-run next_command this poll to push START
-                        except Exception as e:
+                        except OSError as e:
                             log(f"  (motion request write failed: {e})")
         except OSError:
             pass
@@ -947,395 +560,22 @@ def handle_cs(conn, first, peer):
             reply = MEDIA_REPLY_LIVE
         elif kind == "snapshot":
             # the 191B template = 182B opening + '08' stop; the stop goes out only
-            # once the JPEG has arrived (see _capture_media), or the camera quits
+            # once the JPEG has arrived (see liveview.capture_media), or the camera quits
             reply = MEDIA_REPLY_SNAP[:182]
         else:
             reply = MEDIA_REPLY
         log(f"  >> MEDIA upload ({kind}); replying session config ({len(reply)}B), capturing")
         conn.sendall(ts_patch(reply))
-        _capture_media(peer, data, conn, kind, opts, motion=motion)
+        capture_media(peer, data, conn, kind, opts, motion=motion)
     else:
         log(f"  !! unknown opcode 0x{opcode:04x}; logging raw, holding open")
         _dump(peer, "cs_unknown", data, conn)
 
 
-# Liveview stream control, as the real cloud does it (relay capture 2026-10-12):
-#   S> opening (MEDIA_REPLY_LIVE) | C> 51B handshake | S> LIVE_GO -> stream starts
-#   S> LIVE_REPORT every 1s while streaming (a receiver report; the cloud's counters
-#      drift a little, we replay a typical one) | S> LIVE_STOP_1, LIVE_STOP_2 -> end
-LIVE_GO = bytes.fromhex("0d0000000100000000")
-LIVE_REPORT = bytes.fromhex("12000003e8000000180000001f0000003f0010000000000012"
-                            "0000001f00000000")
-LIVE_STOP_1 = bytes.fromhex("070000000000000000")
-LIVE_STOP_2 = bytes.fromhex("080000000000000000")
-LIVE_HANDSHAKE = 51        # camera's liveview handshake: 7 + 9 + 9 + 26 bytes
-MEDIA_END = bytes.fromhex("010000000000000000")   # camera: end of a snapshot upload
-LIVE_SECS = float(os.environ.get("BLINK_LIVE_SECS", "20"))   # default clip length
 
 
-class _PcrFixer:
-    """Make the camera's MPEG-TS playable in real time by a timestamp-driven player.
-    The camera sends a PCR (the TS clock reference) only every 2 s; the spec wants
-    <= 100 ms. GStreamer's tsdemux then mis-maps time and jumps timestamps back
-    ~1.5 s once per 2 s keyframe group -> the window freezes periodically.
-    (The PES timestamps themselves are fine: one per frame, real time.) Fix: put a
-    PCR-only packet (adaptation field, no payload, so continuity counters are
-    untouched) before every video PES with a PTS, at PTS - delay, and rewrite the
-    camera's own PCRs to the same relation. `delay` is the playback cushion; the
-    camera's own relation is 1.5 s."""
-    def __init__(self, delay, pid=0x100):
-        self.pid, self.off, self.rem, self.pts = pid, int(delay * 90000), b"", None
-
-    def _pcr(self):
-        base = max(0, self.pts - self.off) & ((1 << 33) - 1)
-        return bytes([(base >> 25) & 0xff, (base >> 17) & 0xff, (base >> 9) & 0xff,
-                      (base >> 1) & 0xff, ((base & 1) << 7) | 0x7e, 0x00])
-
-    def feed(self, data):
-        buf = self.rem + data
-        n = len(buf) // 188
-        out = bytearray()
-        for i in range(n):
-            p = bytearray(buf[i * 188:(i + 1) * 188])
-            pid = ((p[1] & 0x1f) << 8) | p[2]
-            afc = (p[3] >> 4) & 3
-            pos = 4 + (1 + p[4] if afc in (2, 3) else 0)
-            if pid == self.pid and p[1] & 0x40 and afc in (1, 3) \
-                    and p[pos:pos + 3] == b"\x00\x00\x01" and p[pos + 7] & 0x80:
-                q = p[pos + 9:pos + 14]
-                self.pts = (((q[0] >> 1) & 7) << 30 | q[1] << 22 | (q[2] >> 1) << 15
-                            | q[3] << 7 | q[4] >> 1)
-                af = bytes([183, 0x10]) + self._pcr()
-                out += bytes([0x47, (pid >> 8) & 0x1f, pid & 0xff, 0x20]) + af \
-                    + b"\xff" * (184 - len(af))
-            if afc in (2, 3) and p[4] >= 7 and p[5] & 0x10 and self.pts is not None:
-                p[6:12] = self._pcr()                        # camera's own PCR
-            out += p
-        self.rem = buf[n * 188:]
-        return bytes(out)
 
 
-class _WebLiveFeeder:
-    """De-chunk the camera's 0x0804 stream (9B <type><u32 ctr><u32 len> headers) on
-    the fly and publish the RAW type-0x00 MPEG-TS payload to LIVE_HUB for browser
-    mpegts.js. No PCR fix-up: mpegts.js times off the PES PTS (fine as-is), and the
-    PCR-only packets _PcrFixer injects break mpegts.js continuity tracking -> black."""
-    def __init__(self):
-        self.buf = b""
-    def feed(self, data):
-        self.buf += data
-        out = bytearray()
-        while len(self.buf) >= 9:
-            t, n = self.buf[0], int.from_bytes(self.buf[5:9], "big")
-            if n > 65536:
-                self.buf = b""; break         # lost framing; resync on next upload
-            if len(self.buf) < 9 + n:
-                break
-            if t == 0x00:
-                out += self.buf[9:9 + n]
-            self.buf = self.buf[9 + n:]
-        if out:
-            LIVE_HUB.publish(bytes(out))
-    def close(self):
-        pass
-
-
-class _LivePlayer:
-    """Show a liveview as it arrives: de-chunk the 0x0804 stream on the fly (9B
-    headers <type><u32 ctr><u32 len>, see media_watch) and pipe the type-0x00
-    MPEG-TS payload into a GStreamer window (GPU H.264 decode + AAC audio).
-    Playback follows the stream's timestamps (sync=true) BLINK_LIVE_DELAY seconds
-    behind live (default 1.5 s, the camera's own PCR offset), which absorbs the
-    camera's keyframe bursts; _PcrFixer makes those timestamps usable."""
-    _Q = ["queue", "max-size-time=5000000000", "max-size-buffers=0", "max-size-bytes=0"]
-    CMD = ["gst-launch-1.0", "-q", "fdsrc", "fd=0", "!", "tsdemux", "name=d",
-           "d.", "!", *_Q, "!", "h264parse", "!", "nvh264dec", "!", "videoconvert", "!",
-           "autovideosink", "sync=true",
-           "d.", "!", *_Q, "!", "aacparse", "!", "avdec_aac", "!", "audioconvert", "!",
-           "audioresample", "!", "autoaudiosink", "sync=true"]
-
-    def __init__(self):
-        import shutil, subprocess
-        self.buf = b""
-        self.proc = None
-        self.pcr = _PcrFixer(float(os.environ.get("BLINK_LIVE_DELAY", "1.5")))
-        if not shutil.which("gst-launch-1.0"):
-            log("  (live view: gst-launch-1.0 not found; recording only)"); return
-        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-            log("  (live view: no display in local_server's environment; recording only)"); return
-        cmd = os.environ.get("BLINK_LIVE_PLAYER")
-        cmd = cmd.split() if cmd else self.CMD
-        try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            log("  live view: player window opening")
-        except Exception as e:
-            log(f"  (live view: player failed to start: {e})")
-
-    def feed(self, data):
-        if not self.proc:
-            return
-        self.buf += data
-        out = bytearray()
-        while len(self.buf) >= 9:
-            t, n = self.buf[0], int.from_bytes(self.buf[5:9], "big")
-            if n > 65536:                       # lost framing: stop feeding, keep recording
-                log("  (live view: lost chunk framing; player stopped)"); self.close(); return
-            if len(self.buf) < 9 + n:
-                break
-            if t == 0x00:
-                out += self.buf[9:9 + n]
-            self.buf = self.buf[9 + n:]
-        out = self.pcr.feed(bytes(out)) if out else b""
-        if out:
-            try:
-                self.proc.stdin.write(out); self.proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                log("  (live view: player closed; still recording)"); self.proc = None
-
-    def close(self):
-        if self.proc:
-            try:
-                self.proc.stdin.close()             # EOS: the player finishes and exits
-            except Exception:
-                pass
-            self.proc = None
-
-
-MEDIA_STOP = os.path.join(LOGDIR, "media_stop")   # console touches this to end a stream
-LIVE_MAX_SECS = 600.0                            # safety cap for an open-ended live view
-
-
-def _liveview_session(conn, fh, idle, live=False, secs=None):
-    """Run the server side of a liveview 0x0804 stream, writing camera bytes to fh.
-    Streams for `secs` (default BLINK_LIVE_SECS), or until mitm/local/media_stop
-    appears; with live=True the video is also shown as it arrives."""
-    # 1) the camera's handshake (7+9+9+26 = 51B), then the go-ahead
-    hs, eof = b"", False
-    conn.settimeout(3.0)
-    try:
-        while len(hs) < LIVE_HANDSHAKE:
-            d = conn.recv(4096)
-            if not d:
-                eof = True; break
-            hs += d
-    except socket.timeout:
-        pass
-    conn.settimeout(None)
-    fh.write(hs)
-    if eof:
-        log("  !! camera closed the liveview stream before the handshake"); return
-    try:
-        os.remove(MEDIA_STOP)                       # a stale stop must not end us at once
-    except OSError:
-        pass
-    secs = min(float(secs or LIVE_SECS), LIVE_MAX_SECS)
-    player = _LivePlayer() if live else None
-    web = _WebLiveFeeder()                        # always publish to the browser hub
-    if len(hs) > LIVE_HANDSHAKE:
-        if player:
-            player.feed(hs[LIVE_HANDSHAKE:])      # stream bytes that came with it
-        web.feed(hs[LIVE_HANDSHAKE:])
-    conn.sendall(LIVE_GO)
-    log(f"  liveview: handshake {len(hs)}B -> go; streaming up to {secs:.0f}s"
-        f"{' (live view; stop from the console)' if live else ''}")
-    set_state(streaming={"since": time.time(), "live": bool(live), "secs": secs})
-    # 2) stream: read, send a receiver report every second, and play any talk
-    #    audio from the browser (TALK) on the camera's speaker
-    t_end = time.time() + secs
-    next_report = time.time() + 1.0
-    last_data = time.time()
-    talk_seq, talk_next, talk_sent = 0, 0.0, 0
-    # talk diagnostics, logged once a second while audio flows
-    dg = {"t": time.time(), "sent": 0, "qmax": 0, "gap": 0.0, "loop": 0.0, "drop": TALK.dropped,
-          "last_send": 0.0, "last_iter": time.time(), "restarts": 0}
-    TALK.set_live(True)
-    conn.settimeout(0.2)
-    try:
-        while time.time() < t_end:
-            # Talk: send AAC frames at real-time pace (64 ms each), up to ~2 frames
-            # ahead so our loop granularity never starves the camera's buffer.
-            now = time.time()
-            dg["loop"] = max(dg["loop"], now - dg["last_iter"]); dg["last_iter"] = now
-            dg["qmax"] = max(dg["qmax"], TALK.qlen())
-            idle_gap = talk_next < now - 0.2
-            if idle_gap and talk_sent:
-                log(f"  talk: played {talk_sent} frame(s) ({talk_sent * TALK_FRAME_SECS:.1f}s)")
-                set_state(talk_played={"frames": talk_sent, "secs": round(talk_sent * TALK_FRAME_SECS, 2),
-                                       "ts": time.time()})
-                talk_sent = 0
-            if idle_gap and TALK.primed():          # (re)start a burst once pre-buffered
-                talk_next = now
-                dg["restarts"] += 1
-                # Each press is its own talk burst with seq from 0, like the cloud's
-                # (0..73). Continuing the count across presses, the camera played
-                # only the first press of a live view.
-                if TALK.take_new_burst() and TALK.seq_mode == "reset" and talk_seq:
-                    log(f"  talk: new press, seq {talk_seq} -> 0")
-                    talk_seq = 0
-            while talk_next >= now - 0.2 and talk_next <= now + 2 * TALK_FRAME_SECS:
-                fr = TALK.pop()
-                if fr is None:
-                    break
-                conn.sendall(bytes([TALK_RECORD]) + struct.pack(">II", talk_seq, len(fr)) + fr)
-                talk_seq += 1; talk_sent += 1; talk_next += TALK_FRAME_SECS
-                t_s = time.time()
-                if dg["last_send"]:
-                    dg["gap"] = max(dg["gap"], t_s - dg["last_send"])
-                dg["last_send"] = t_s; dg["sent"] += 1
-            if now - dg["t"] >= 1.0:
-                if DEBUG and (dg["sent"] or dg["qmax"] or TALK.dropped != dg["drop"]):
-                    log(f"  talk/s: sent={dg['sent']} seq={talk_seq} q_max={dg['qmax']} "
-                        f"max_gap={1000 * dg['gap']:.0f}ms loop_max={1000 * dg['loop']:.0f}ms "
-                        f"dropped={TALK.dropped - dg['drop']} restarts={dg['restarts']}")
-                dg.update(t=now, sent=0, qmax=0, gap=0.0, loop=0.0, drop=TALK.dropped, restarts=0)
-            conn.settimeout(0.02 if TALK.pending() else 0.2)
-            if os.path.exists(MEDIA_STOP):
-                log("  liveview: stop requested")
-                break
-            try:
-                d = conn.recv(65536)
-                if not d:
-                    log("  liveview: camera ended the stream"); return
-                fh.write(d); last_data = time.time()
-                if player:
-                    player.feed(d)
-                web.feed(d)
-            except socket.timeout:
-                if time.time() - last_data > idle:
-                    log(f"  !! liveview: no data for {idle:.0f}s, giving up"); return
-            if time.time() >= next_report:
-                conn.sendall(LIVE_REPORT); next_report += 1.0
-        # 3) stop, drain what's in flight, close
-        conn.sendall(LIVE_STOP_1); conn.sendall(LIVE_STOP_2)
-        conn.settimeout(0.3)
-        try:
-            while True:
-                d = conn.recv(65536)
-                if not d: break
-                fh.write(d)
-                if player:
-                    player.feed(d)
-                web.feed(d)
-        except Exception:
-            pass
-        log("  liveview: sent stop")
-    finally:
-        TALK.set_live(False)
-        if player:
-            player.close()
-        web.close()
-        try:
-            os.remove(MEDIA_STOP)
-        except OSError:
-            pass
-        set_state(streaming=None)
-
-
-def _capture_media(peer, first, conn, kind="media", opts=None, motion=False):
-    """Drain a 0x0804 upload to disk, then de-chunk it (media_watch.split_streams):
-    snapshot -> .jpg, liveview -> .ts (H.264+AAC) + .thumb.jpg."""
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    # motion clips are tagged in the filename so the gallery can tell them apart
-    raw = os.path.join(LOGDIR, f"{ts}_{peer[0]}_{'motion' if motion else kind}_0804.bin")
-    fh = open(raw, "wb"); fh.write(first)
-    # An upload starting means the request was honoured: clear it NOW, or every
-    # poll during the upload sends another ARM (camera red-LEDs mid-upload).
-    _clear_media_request()
-    # The camera keeps the connection open after its last byte, so end on a short
-    # idle gap (liveview streams continuously) rather than a 30s timeout -- the
-    # console's 50s wait used to expire before we published last_media.
-    idle = float(os.environ.get("BLINK_MEDIA_IDLE", "5"))
-    try:
-        if kind == "liveview":
-            _liveview_session(conn, fh, idle, **(opts or {}))
-        else:
-            # A snapshot ends with a 9B end marker (01 00000000 00000000) after the
-            # JPEG + a 152B type-02 trailer; the camera then waits for the cloud's
-            # '08' stop. Send it right away instead of waiting out an idle timeout.
-            conn.settimeout(idle)
-            tail = b""
-            while True:
-                d = conn.recv(65536)
-                if not d: break
-                fh.write(d)
-                tail = (tail + d)[-9:]
-                if tail == MEDIA_END:
-                    conn.sendall(LIVE_STOP_2)
-                    log("  snapshot complete -> sent stop")
-                    break
-    except Exception:
-        pass
-    finally:
-        fh.close()
-    data = open(raw, "rb").read()
-    log(f"  upload saved: {os.path.relpath(raw, ROOT)} ({len(data)} bytes)")
-    out = None; frames = None; thumb_path = None
-    # Classify on the COMPLETE upload: the first recv (~366B) usually ends before
-    # the JPEG SOI / TS payload starts, so the early guess is often just "media".
-    kind = bp.media_kind(data)[0]
-    try:
-        # The upload is chunked (<type:1><u32 ctr><u32 len> + payload, see
-        # media_watch.py): type 0x04 = JPEG, type 0x00 = MPEG-TS. Carving a JPEG
-        # straight out of the raw stream leaves the 9B chunk headers inside it
-        # (image corrupt below the first chunk), so de-chunk first.
-        streams = media_watch.split_streams(data)
-        tsb, jpg = streams.get(0x00, b""), streams.get(0x04, b"")
-        if tsb[:1] == b"\x47" and len(tsb) >= 188:       # liveview: H.264+AAC in TS
-            kind, frames = "liveview", len(tsb) // 188
-            out = raw[:-4] + ".ts"
-            open(out, "wb").write(tsb)
-            log(f"  saved liveview MPEG-TS: {os.path.relpath(out, ROOT)} ({frames} TS packets)  "
-                f"view: gst-launch-1.0 filesrc location={out} ! tsdemux ! h264parse ! "
-                f"nvh264dec ! videoconvert ! autovideosink")
-            thumb = media_watch._carve_jpeg(jpg)
-            if thumb:
-                thumb_path = raw[:-4] + ".thumb.jpg"
-                open(thumb_path, "wb").write(thumb)
-            mp4 = _to_mp4(out)
-            if mp4:
-                out = mp4
-                log(f"  remuxed MP4 (H.264+AAC, no re-encode): {os.path.relpath(mp4, ROOT)}  file://{mp4}")
-            else:
-                log("  (MP4 remux failed: no ffmpeg/gst-launch-1.0? kept the .ts)")
-        else:
-            clean = media_watch._carve_jpeg(jpg) or media_watch._carve_jpeg(data)
-            if clean:
-                kind = "snapshot"
-                out = raw[:-4] + ".jpg"
-                open(out, "wb").write(clean)
-                log(f"  saved JPEG snapshot: {os.path.relpath(out, ROOT)} ({len(clean)} bytes, "
-                    f"{'de-chunked' if jpg else 'raw-carve'})  file://{out}")
-            else:
-                log(f"  (no JPEG or MPEG-TS found in upload; streams={ {hex(k): len(v) for k, v in streams.items()} })")
-    except Exception as e:
-        log(f"  (decode skipped: {e})")
-    if not DEBUG and out:
-        # keep only the playable result; the raw upload (and the .ts once the
-        # .mp4 exists) are protocol-debugging leftovers -- set BLINK_DEBUG=1 to keep
-        drop = [raw]
-        if out.endswith(".mp4"):
-            drop.append(out[:-4] + ".ts")
-        for f in drop:
-            try: os.remove(f)
-            except OSError: pass
-        raw = None
-    if motion:   # single ntfy push: with the snapshot if we got one, else text-only
-        when = datetime.datetime.strptime(ts, "%Y%m%d-%H%M%S").strftime("%H:%M:%S")
-        if thumb_path:
-            notify_motion_snapshot(thumb_path, when,
-                                   out if out and out.endswith(".mp4") else None)
-        else:
-            notify_motion()
-    try:
-        set_state(last_media={"ts": time.time(), "kind": kind,
-                              "raw": (os.path.relpath(raw, ROOT) if raw else None),
-                              "out": (os.path.relpath(out, ROOT) if out else None),
-                              "abs": (out or raw),
-                              "frames": frames, "bytes": len(data), "motion": bool(motion)})
-    except Exception:
-        pass
-    _clear_media_request()        # streaming started -> request satisfied
 
 
 def _dump(peer, kind, first, conn):
@@ -1350,8 +590,8 @@ def _dump(peer, kind, first, conn):
             d = conn.recv(65536)
             if not d: break
             fh.write(d); fh.flush()
-    except Exception:
-        pass
+    except OSError:
+        pass                     # timeout or closed: the capture is complete
     finally:
         fh.close()
 
@@ -1393,10 +633,12 @@ def _save_flow(peer, c2s, s2c):
         else:
             tag = "unknown"
         base = os.path.join(fd, f"{datetime.datetime.now():%H%M%S-%f}_{tag}")
-        open(base + ".c2s.bin", "wb").write(bytes(c2s))
-        open(base + ".s2c.bin", "wb").write(bytes(s2c))
-    except Exception:
-        pass
+        with open(base + ".c2s.bin", "wb") as f:
+            f.write(bytes(c2s))
+        with open(base + ".s2c.bin", "wb") as f:
+            f.write(bytes(s2c))
+    except OSError as e:
+        log(f"  (cannot save flow: {e})")
 
 
 def handle(raw, peer):
@@ -1406,11 +648,8 @@ def handle(raw, peer):
     # storm, which in turn kept the camera from establishing a stable session.
     try:
         raw.settimeout(15)
-    except Exception:
-        pass
-    try:
         conn = TeeConn(SRV.wrap_socket(raw, server_side=True))
-    except Exception as e:
+    except OSError as e:                  # ssl.SSLError and timeouts are OSErrors
         log(f"TLS failed from {peer[0]}: {e}"); raw.close(); return
     try:
         conn.settimeout(20)
@@ -1425,13 +664,13 @@ def handle(raw, peer):
         else:
             log(f"?? {peer[0]} unrecognized first bytes {first[:16].hex()} -- capturing")
             _dump(peer, "unknown", first, conn)
-    except Exception as e:
-        log(f"handler error {peer[0]}: {e}")
+    except Exception as e:                # one bad connection must not kill the server
+        log_error(f"handler error {peer[0]}", e)
     finally:
         if conn.c2s:
             _save_flow(peer, conn.c2s, conn.s2c)
         try: conn.close()
-        except Exception: pass
+        except OSError: pass
 
 
 # ---- interval (time-lapse) snapshots ------------------------------------
@@ -1453,21 +692,22 @@ def _timelapse_janitor():
                 log(f"time-lapse: {('a snapshot every %gs' % iv) if iv > 0 else 'disabled'}")
             now = time.time()
             if iv > 0 and now - _timelapse["last"] >= iv:
-                with _state_lock:
-                    seen = _state.get("last_seen", 0)
-                    streaming = _state.get("streaming")
+                st = get_state("last_seen", "streaming")
+                seen, streaming = st["last_seen"] or 0, st["streaming"]
                 if (now - seen < 30 and not streaming and not _media.get("active")
                         and not os.path.exists(MEDIA_REQ)):
                     with open(MEDIA_REQ, "w") as f:
                         json.dump({"mode": "snapshot", "ts": now, "timelapse": True}, f)
                     _timelapse["last"] = now
                     log(f"  >> TIME-LAPSE snapshot (every {iv:g}s)")
-        except Exception as e:
-            log(f"(time-lapse error: {e})")
+        except Exception as e:            # keep the scheduler alive
+            log_error("time-lapse", e)
         time.sleep(5)
 
 
 def main():
+    global SRV
+    SRV = server_ctx()
     ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ls.bind(LISTEN); ls.listen(256)   # generous backlog; the camera opens bursts of connections
@@ -1479,8 +719,8 @@ def main():
                     os.environ.get("BLINK_MEDIA_IP", "10.10.10.1"),
                     int(os.environ.get("BLINK_WEB_PORT", "8090")),
                     get_settings=get_settings, settings_file=SETTINGS_FILE, talk=TALK)
-    except Exception as e:
-        log(f"(webui failed to start: {e})")
+    except Exception as e:                # the camera side still works without it
+        log_error("webui failed to start", e)
     log(f"debug captures: {'ON (raw uploads, .ts, flows/, polls/ kept)' if DEBUG else 'off'}  [BLINK_DEBUG]")
     if RETENTION_DAYS > 0:
         threading.Thread(target=_retention_janitor, daemon=True).start()

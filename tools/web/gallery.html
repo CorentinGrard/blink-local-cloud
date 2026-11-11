@@ -1,0 +1,71 @@
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name=theme-color content="#0e1013">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<title>Blink Gallery</title>
+<script src="/static/mpegts.js"></script>
+<style>__CSS__
+.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tabs button{min-height:34px;padding:5px 13px;font-size:14px;border-radius:999px;background:var(--card);color:var(--fg);border:1px solid var(--line)}
+.tabs button.on{background:var(--acc);color:var(--acc-fg);border-color:var(--acc)}
+.tabs .n{opacity:.65;font-weight:500;margin-left:2px}
+.toolbar .right{margin-left:auto;display:flex;gap:10px;align-items:center}
+@media (max-width:560px){.toolbar{flex-wrap:nowrap}.tabs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;flex:1;min-width:0}
+.tabs::-webkit-scrollbar{display:none}.tabs button{flex:none}.summary{display:none}.right button{min-height:34px;padding:5px 12px;font-size:14px}}
+.summary{font-size:13px;color:var(--mut)}
+.dayh{display:flex;align-items:baseline;gap:10px;margin:24px 0 10px}
+.dayh h2{font-size:15px;margin:0;font-weight:650}
+.dayh .mut{font-size:13px}
+.dayh button{margin-left:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+@media (max-width:560px){.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}}
+.it{position:relative;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;padding:0;color:inherit;font:inherit;text-align:left;display:block;width:100%;min-height:0}
+.it:hover{border-color:#3a4150}
+.it.sel{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc)}
+.th{position:relative;aspect-ratio:16/9;background:#000}
+.th img{width:100%;height:100%;object-fit:cover;display:block}
+.badge{position:absolute;left:7px;top:7px;background:rgba(0,0,0,.68);color:#fff;font-size:11.5px;font-weight:650;padding:2px 8px;border-radius:999px}
+.badge.motion{background:rgba(245,166,35,.92);color:#1c1200}
+.dur{position:absolute;right:7px;bottom:7px;background:rgba(0,0,0,.72);color:#fff;font-size:12px;font-weight:600;padding:1px 6px;border-radius:5px;font-variant-numeric:tabular-nums}
+.play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:30px;color:#fff;text-shadow:0 2px 10px rgba(0,0,0,.8);opacity:.85}
+.chk{position:absolute;right:7px;top:7px;width:24px;height:24px;border-radius:50%;border:2px solid #fff;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;font-size:14px;color:#fff}
+.selecting .chk{display:flex;color:transparent}
+body.selmode #toasts{bottom:84px}.it.sel .chk{background:var(--acc);border-color:var(--acc);color:var(--acc-fg)}
+.meta{padding:7px 10px;font-size:13px;color:var(--mut);display:flex;justify-content:space-between;gap:6px}
+.meta b{color:var(--fg);font-weight:600}
+.empty{color:var(--mut);text-align:center;padding:70px 16px}
+.selbar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);background:#232833;border:1px solid var(--line);border-radius:14px;padding:8px 8px 8px 16px;display:flex;align-items:center;gap:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);z-index:15;width:max-content;max-width:calc(100vw - 24px)}
+.selbar[hidden]{display:none}
+#lb{position:fixed;inset:0;background:rgba(5,6,8,.96);display:none;flex-direction:column;z-index:30}
+#lb.on{display:flex}
+#lbtop{display:flex;align-items:center;gap:8px;padding:10px 12px;color:var(--mut);font-size:14px}
+#lbtop .t{color:var(--fg);font-weight:600;margin-right:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#lbtop button,#lbtop a{background:rgba(255,255,255,.08);color:var(--fg);min-height:38px;padding:7px 12px;font-size:14px;border:0;border-radius:9px}
+#lbm{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:0 8px;position:relative;touch-action:pan-y}
+#lbm img,#lbm video{max-width:100%;max-height:100%;border-radius:8px;background:#000}
+.nav{position:absolute;top:50%;transform:translateY(-50%);background:rgba(255,255,255,.1);color:#fff;width:44px;height:64px;border-radius:10px;font-size:22px;padding:0;z-index:2}
+.nav.p{left:10px}.nav.n{right:10px}
+#lbcount{text-align:center;color:var(--mut);font-size:13px;padding:8px}
+@media (max-width:560px){.nav{display:none}#lbtop .lbl{display:none}}
+</style></head><body>
+__HEADER__
+<main>
+ <div class=toolbar>
+  <div class=tabs role=tablist id=tabs></div>
+  <div class=right><span class=summary id=summary></span><button class=sec id=selbtn>Select</button></div>
+ </div>
+ <div id=list><div class=empty>Loading…</div></div>
+</main>
+<div class=selbar id=selbar hidden><span id=selcount>0 selected</span>
+ <button class=sec id=selall>Select all</button><button class=danger id=seldel disabled>Delete</button><button class=sec id=selcancel>Done</button></div>
+<div id=lb role=dialog aria-modal=true aria-label="Media viewer">
+ <div id=lbtop><span class=t id=lbt></span>
+  <a id=dl class=btn download title=Download>__I_dl__<span class=lbl>Download</span></a>
+  <button id=lbdel title=Delete>__I_trash__<span class=lbl>Delete</span></button>
+  <button id=cls title="Close (Esc)" aria-label=Close>__I_x__</button></div>
+ <div id=lbm><button class="nav p" id=prev aria-label=Previous>‹</button><div id=lbc style="display:contents"></div><button class="nav n" id=next aria-label=Next>›</button></div>
+ <div id=lbcount></div>
+</div>
+__CONFIRM__
+<script>__GALLERY_JS__</script></body></html>

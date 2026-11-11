@@ -1,0 +1,100 @@
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name=theme-color content="#0e1013">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<title>Blink Camera</title>
+<script src="/static/mpegts.js"></script>
+<style>__CSS__
+.grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:16px;align-items:start}
+.col{display:flex;flex-direction:column;gap:16px;min-width:0}
+@media (max-width:860px){.grid{grid-template-columns:minmax(0,1fr)}}
+.stage{position:relative;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden}
+.stage video,.stage img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+.ph{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;color:var(--mut);font-size:14px;text-align:center;padding:16px}
+.ph img{opacity:.35}
+.overlay{position:absolute;left:10px;top:10px;display:flex;gap:6px;pointer-events:none}
+.tag{background:rgba(0,0,0,.65);color:#fff;font-size:12px;font-weight:650;padding:3px 9px;border-radius:999px;display:inline-flex;align-items:center;gap:6px}
+.tag .dot{width:7px;height:7px;box-shadow:none}
+.vtools{position:absolute;right:10px;top:10px;display:flex;gap:6px}
+.vtools button{background:rgba(0,0,0,.6);color:#fff;min-height:34px;padding:6px 10px;font-size:13px;border-radius:8px}
+.spin{width:28px;height:28px;border:3px solid rgba(255,255,255,.15);border-top-color:var(--acc);border-radius:50%;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center}
+.btns select{min-height:42px}
+.hint{color:var(--mut);font-size:13px;margin-top:8px;min-height:20px}
+#talk{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#talk.on{background:var(--bad);color:#fff}
+.hint.bad{color:var(--bad)}
+.shot{cursor:zoom-in;display:block}
+.recent{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.recent a{position:relative;display:block;aspect-ratio:16/9;border-radius:8px;overflow:hidden;background:#000;border:1px solid var(--line)}
+.recent a:hover{border-color:var(--acc)}
+.recent img{width:100%;height:100%;object-fit:cover;display:block}
+.recent .tag{position:absolute;left:5px;bottom:5px;font-size:11px;padding:1px 7px}
+.recent .empty{grid-column:1/-1;color:var(--mut);font-size:14px;padding:8px 0}
+.set{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 0;border-bottom:1px solid var(--line)}
+.set:last-child{border-bottom:0}.set label{font-weight:500;font-size:15px}
+select{font:inherit;font-size:15px;background:#0d0f13;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+input[type=range]{width:min(150px,38vw);accent-color:var(--acc)}
+.rng{display:flex;align-items:center;gap:8px}.rng output{color:var(--mut);width:30px;text-align:right;font-variant-numeric:tabular-nums;font-size:14px}
+.armbox{display:flex;align-items:center;gap:9px}
+.armbox .lbl{font-size:13px;font-weight:650;color:var(--mut)}
+.armbox.on .lbl{color:var(--warn)}
+.armbox.on .sl{background:var(--warn)!important}
+.setmsg{font-size:13px;color:var(--mut)}.setmsg.ok{color:var(--ok)}
+</style></head><body>
+__HEADER__
+<main><div class=grid>
+ <div class=col>
+  <section class=card aria-labelledby=hlive>
+   <h2 id=hlive>Live view <span class=aside id=lvaside></span></h2>
+   <div class=stage id=stage>
+    <video id=vid autoplay muted playsinline hidden></video>
+    <div class=ph id=vph><span id=vphmsg>Start the live view to watch the camera.</span></div>
+    <div class=overlay id=vov hidden><span class=tag><span class="dot live"></span>LIVE <span id=countdown></span></span></div>
+    <div class=vtools id=vtools hidden><button id=mute title="Toggle sound">__I_mute__ Sound off</button><button id=fs title="Fullscreen" aria-label=Fullscreen>__I_fs__</button></div>
+   </div>
+   <div class=btns>
+    <button id=live>__I_play__ Start live</button>
+    <button class=sec id=stop hidden>__I_stop__ Stop</button>
+    <button class=sec id=talk hidden title="Hold to speak through the camera (Space)">__I_mic__ Hold to talk</button>
+    <select id=secs aria-label="Live view duration"><option value=60>1 min</option><option value=180>3 min</option><option value=300 selected>5 min</option><option value=600>10 min</option></select>
+   </div>
+   <div class=hint id=vmsg></div>
+  </section>
+  <section class=card aria-labelledby=hrecent>
+   <h2 id=hrecent>Recent activity <a class=aside href="/gallery">See all →</a></h2>
+   <div class=recent id=recent><div class=empty>Loading…</div></div>
+  </section>
+ </div>
+ <div class=col>
+  <section class=card aria-labelledby=hsnap>
+   <h2 id=hsnap>Latest snapshot <span class=aside id=shotwhen></span></h2>
+   <a class="stage shot" id=shotlink href="/gallery" title="Open in gallery">
+    <img id=shot alt="Latest snapshot" hidden><div class=ph id=sph>No snapshot yet</div>
+   </a>
+   <div class=btns><button id=snap>__I_cam__ Take snapshot</button></div>
+   <div class=hint id=smsg></div>
+  </section>
+  <section class=card aria-labelledby=hset>
+   <h2 id=hset>Settings</h2>
+   <div id=settings></div>
+   <div class=btns><button id=save disabled>Save</button><button class=sec id=revert hidden>Revert</button><span class=setmsg id=setmsg></span></div>
+  </section>
+  <section class=card aria-labelledby=htl>
+   <h2 id=htl>Time-lapse</h2>
+   <div class=set><label for=tl>Auto snapshot</label>
+    <select id=tl aria-label="Automatic snapshot interval">
+     <option value=0>Off</option>
+     <option value=60>Every 1 min</option>
+     <option value=300>Every 5 min</option>
+     <option value=900>Every 15 min</option>
+     <option value=1800>Every 30 min</option>
+     <option value=3600>Every hour</option>
+    </select></div>
+   <div class=hint id=tlmsg>Automatically saves a snapshot on a fixed interval. Off by default.</div>
+  </section>
+ </div>
+</div></main>
+__CONFIRM__
+<script>__CAMERA_JS__</script></body></html>
