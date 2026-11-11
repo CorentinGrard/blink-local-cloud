@@ -446,12 +446,12 @@ def start(hub, logdir, media_req, media_stop, media_ip, port=8090,
                 if q.get("format") == "adts":         # pre-encoded AAC, queued as-is
                     ok = talk.feed_adts(pcm)
                     return self._json({"ok": ok}, 200 if ok else 409)
-                if not talk.ready():
-                    return self._json({"msg": "ffmpeg not installed"}, 503)
                 try: rate = int(q.get("rate", 0))
                 except ValueError: rate = 0
-                if not 8000 <= rate <= 96000:
+                if not 8000 <= rate <= 96000:             # bad request first (400),
                     return self._json({"msg": "bad rate"}, 400)
+                if not talk.ready():                     # then a missing encoder (503)
+                    return self._json({"msg": "ffmpeg not installed"}, 503)
                 ok = talk.feed(sid, rate, pcm[:len(pcm) & ~1])
                 self._json({"ok": ok}, 200 if ok else 409)
             elif p == "/api/stop":

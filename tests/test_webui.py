@@ -1,7 +1,7 @@
 """Dashboard: pages build cleanly, page scripts parse, and the HTTP API behaves."""
 import json, os, re, socket, subprocess, tempfile, unittest, urllib.error, urllib.request
 
-from helpers import HAVE_NODE, LOGDIR
+from helpers import HAVE_FFMPEG, HAVE_NODE, LOGDIR
 import common, liveview, talk
 import local_server as ls
 import webui
@@ -86,7 +86,9 @@ class WebUITest(unittest.TestCase):
     def test_talk_endpoint(self):
         oct = "application/octet-stream"
         talk.TALK.set_live(False)
-        self.assertEqual(self.post("/api/talk?sid=ab1&rate=48000", b"\0" * 960, oct)[0], 409)
+        # no live view -> 409; without ffmpeg the encoder check answers first (503)
+        self.assertEqual(self.post("/api/talk?sid=ab1&rate=48000", b"\0" * 960, oct)[0],
+                         409 if HAVE_FFMPEG else 503)
         self.assertEqual(self.post("/api/talk?sid=../x&rate=48000", b"\0" * 960, oct)[0], 400)
         self.assertEqual(self.post("/api/talk?sid=ab1&rate=5", b"\0" * 960, oct)[0], 400)
         self.assertEqual(self.post("/api/talk?sid=ab1&format=adts", b"", oct)[0], 409)
